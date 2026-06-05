@@ -2,6 +2,8 @@
 
 A private personal workflow automation app for running local Python and terminal tools as visual workflows. It stores users, projects, workflows, and runs in MongoDB, keeps files on the local filesystem under `DATA_ROOT`, and streams child process logs to the browser with Socket.IO.
 
+<img width="1364" height="764" alt="image" src="https://github.com/user-attachments/assets/3ce80a0a-585d-44d2-9fe3-c7be0b6bdf87" />
+
 ## Stack
 
 - Frontend: React, Vite, TypeScript, MUI, Zustand, TanStack Query, React Hook Form, Zod, Socket.IO Client, `@xyflow/react`
