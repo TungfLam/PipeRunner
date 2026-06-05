@@ -279,21 +279,8 @@ class WorkflowRunnerService {
       exportDir: runItem.exportDir || undefined
     };
 
-    const staleOutputPaths = new Set<string>();
-    for (const node of executionOrder.slice(startIndex)) {
-      const outputs = this.buildNodeOutputs(node, item.dirs.outputDir);
-      for (const [name, relativePath] of Object.entries(outputs.relativeByName)) {
-        staleOutputPaths.add(relativePath);
-        await fs.rm(outputs.absoluteByName[name], { force: true }).catch(() => undefined);
-      }
-    }
-
-    const existingItemOutputs = (runItem.outputFiles || [])
-      .map((file) => this.normalizeStoredFile(file))
-      .filter((file) => !staleOutputPaths.has(file.relativePath));
-    const existingRunOutputs = (run.outputFiles || []).map((file) => this.normalizeStoredFile(file)).filter(
-      (file) => file.itemId !== item.itemId || !staleOutputPaths.has(file.relativePath)
-    );
+    const existingItemOutputs = (runItem.outputFiles || []).map((file) => this.normalizeStoredFile(file));
+    const existingRunOutputs = (run.outputFiles || []).map((file) => this.normalizeStoredFile(file));
     const nextSteps = this.stepsForRerun(executionOrder, (runItem.steps || []).map((step) => this.normalizeRunStep(step)), startIndex);
     this.cancelledRuns.delete(runId);
 
@@ -732,15 +719,19 @@ class WorkflowRunnerService {
           templateByName: resolvedOutputs.absoluteByName
         });
         const outputFiles = this.outputFilesForNode(node, resolvedOutputs.relativeByName, input.item.itemId);
-        runOutputFiles.push(...outputFiles);
+        const newOutputFiles = outputFiles.filter((file) => {
+          const isDuplicate = runOutputFiles.some(
+            (existingFile) => existingFile.itemId === file.itemId && existingFile.relativePath === file.relativePath
+          );
+          return !isDuplicate;
+        });
+        runOutputFiles.push(...newOutputFiles);
 
-        await RunModel.updateOne(
-          { _id: input.runId, userId: input.userId, [`items.${input.item.index}`]: { $exists: true } },
-          {
-            $set: { [`items.${input.item.index}.outputFiles`]: runOutputFiles },
-            $push: { outputFiles: { $each: outputFiles } }
-          }
-        );
+        const update: Record<string, unknown> = { $set: { [`items.${input.item.index}.outputFiles`]: runOutputFiles } };
+        if (newOutputFiles.length > 0) {
+          update.$push = { outputFiles: { $each: newOutputFiles } };
+        }
+        await RunModel.updateOne({ _id: input.runId, userId: input.userId, [`items.${input.item.index}`]: { $exists: true } }, update);
         for (const file of outputFiles) {
           socketService.emitToRun(input.runId, "step:output", { runId: input.runId, itemId: input.item.itemId, nodeId: node.id, file });
         }
@@ -963,6 +954,7 @@ class WorkflowRunnerService {
       try {
         child = spawn(input.bin, input.args, {
           cwd: input.cwd,
+          detached: process.platform !== "win32",
           shell: false,
           env: {
             ...process.env,
@@ -982,6 +974,9 @@ class WorkflowRunnerService {
       this.activeChildren.set(input.runId, activeChildren);
 
       const onChunk = (stream: "stdout" | "stderr", chunk: Buffer) => {
+        if (settled) {
+          return;
+        }
         emitRunnerLog(stream, chunk.toString());
       };
 
@@ -989,20 +984,20 @@ class WorkflowRunnerService {
       child.stderr.on("data", (chunk: Buffer) => onChunk("stderr", chunk));
 
       child.on("error", (error) => {
+        this.activeChildren.get(input.runId)?.delete(child);
         if (settled) return;
         settled = true;
         if (timeout) clearTimeout(timeout);
         emitRunnerLog("stderr", `[runner] spawn error: ${error.message}\n`);
         logStream.end();
-        this.activeChildren.get(input.runId)?.delete(child);
         reject(error);
       });
 
       child.on("close", (exitCode) => {
-        if (settled) return;
-        settled = true;
         if (timeout) clearTimeout(timeout);
         this.activeChildren.get(input.runId)?.delete(child);
+        if (settled) return;
+        settled = true;
 
         if (this.cancelledRuns.has(input.runId)) {
           emitRunnerLog("stderr", "[runner] command cancelled\n");
@@ -1026,10 +1021,11 @@ class WorkflowRunnerService {
         timeout = setTimeout(() => {
           if (settled) return;
           settled = true;
-          child.kill("SIGTERM");
+          this.signalChildProcess(child, "SIGTERM");
+          const forceKillTimer = setTimeout(() => this.signalChildProcess(child, "SIGKILL"), 2500);
+          forceKillTimer.unref();
           emitRunnerLog("stderr", `[runner] command timed out after ${input.timeoutSeconds} seconds\n`);
           logStream.end();
-          this.activeChildren.get(input.runId)?.delete(child);
           reject(new Error(`Command timed out after ${input.timeoutSeconds} seconds`));
         }, input.timeoutSeconds * 1000);
       }
@@ -1042,16 +1038,63 @@ class WorkflowRunnerService {
         continue;
       }
 
-      if (!child.killed) {
-        child.kill("SIGTERM");
-      }
+      this.signalChildProcess(child, "SIGTERM");
 
       const forceKillTimer = setTimeout(() => {
         if (child.exitCode === null && child.signalCode === null) {
-          child.kill("SIGKILL");
+          this.signalChildProcess(child, "SIGKILL");
         }
       }, 2500);
       forceKillTimer.unref();
+    }
+  }
+
+  private signalChildProcess(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return;
+    }
+
+    if (process.platform !== "win32" && child.pid) {
+      const descendantPids = this.descendantPids(child.pid);
+      try {
+        process.kill(-child.pid, signal);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ESRCH") {
+          // Fall back to direct PID signalling below.
+        }
+      }
+
+      for (const pid of descendantPids) {
+        try {
+          process.kill(pid, signal);
+        } catch {
+          // The process may already be gone after the process-group signal.
+        }
+      }
+    }
+
+    if (!child.killed || signal === "SIGKILL") {
+      child.kill(signal);
+    }
+  }
+
+  private descendantPids(pid: number): number[] {
+    if (process.platform !== "linux") {
+      return [];
+    }
+
+    try {
+      const children = fsSync
+        .readFileSync(`/proc/${pid}/task/${pid}/children`, "utf8")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0);
+      return children.flatMap((childPid) => [...this.descendantPids(childPid), childPid]);
+    } catch {
+      return [];
     }
   }
 
