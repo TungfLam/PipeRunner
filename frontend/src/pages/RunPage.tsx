@@ -1,5 +1,6 @@
 import CancelIcon from "@mui/icons-material/Cancel";
 import RefreshIcon from "@mui/icons-material/Refresh";
+import RestartAltIcon from "@mui/icons-material/RestartAlt";
 import Alert from "@mui/material/Alert";
 import { useTheme } from "@mui/material/styles";
 import Box from "@mui/material/Box";
@@ -67,6 +68,19 @@ export function RunPage() {
   const cancelRun = useMutation({
     mutationFn: async () => api.post(`/runs/${runId}/cancel`),
     onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["run", runId] })
+  });
+
+  const rerunStep = useMutation({
+    mutationFn: async (input: { nodeId: string; itemId?: string }) => api.post(`/runs/${runId}/rerun`, input),
+    onMutate: () => {
+      setLiveLogs({});
+    },
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["run", runId] }),
+        queryClient.invalidateQueries({ queryKey: ["run-logs", runId] })
+      ]);
+    }
   });
 
   useEffect(() => {
@@ -270,7 +284,7 @@ export function RunPage() {
               <TableCell>Status</TableCell>
               <TableCell>Command</TableCell>
               <TableCell>Error</TableCell>
-              <TableCell align="right">Logs</TableCell>
+              <TableCell align="right">Actions</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
@@ -293,9 +307,27 @@ export function RunPage() {
                   )}
                 </TableCell>
                 <TableCell align="right">
-                  <Button size="small" onClick={() => setSelectedNodeId(step.nodeId)}>
-                    View
-                  </Button>
+                  <Stack direction="row" spacing={1} justifyContent="flex-end">
+                    {["failed", "cancelled"].includes(step.status) &&
+                      selectedItem &&
+                      !["running", "pending"].includes(runQuery.data.status) && (
+                      <Button
+                        size="small"
+                        color="secondary"
+                        startIcon={<RestartAltIcon />}
+                        disabled={rerunStep.isPending}
+                        onClick={() => {
+                          setSelectedNodeId(step.nodeId);
+                          rerunStep.mutate({ nodeId: step.nodeId, itemId: selectedItem.itemId });
+                        }}
+                      >
+                        Rerun
+                      </Button>
+                    )}
+                    <Button size="small" onClick={() => setSelectedNodeId(step.nodeId)}>
+                      View
+                    </Button>
+                  </Stack>
                 </TableCell>
               </TableRow>
             ))}

@@ -91,6 +91,7 @@ class Semaphore {
 
 class WorkflowRunnerService {
   private activeChildren = new Map<string, Set<ChildProcessWithoutNullStreams>>();
+  private activeExecutions = new Set<string>();
   private cancelledRuns = new Set<string>();
 
   async startRun(input: StartRunInput) {
@@ -185,11 +186,7 @@ class WorkflowRunnerService {
     }
 
     this.cancelledRuns.add(runId);
-    for (const child of this.activeChildren.get(runId) || []) {
-      if (!child.killed) {
-        child.kill("SIGTERM");
-      }
-    }
+    this.requestStopActiveChildren(runId);
 
     const steps = (run.steps || []).map((step) =>
       ["waiting", "running"].includes(step.status)
@@ -213,6 +210,128 @@ class WorkflowRunnerService {
       { $set: { status: "cancelled", finishedAt: new Date(), steps, items, errorMessage: "Run cancelled" } }
     );
     socketService.emitToRun(runId, "run:finished", { runId, status: "cancelled" });
+    return RunModel.findOne({ _id: runId, userId }).lean();
+  }
+
+  async rerunFromNode(userId: string, runId: string, nodeId: string, itemId?: string) {
+    const run = await RunModel.findOne({ _id: runId, userId }).lean();
+    if (!run) {
+      throw new HttpError(404, "Run not found");
+    }
+    if (run.status === "running" || run.status === "pending") {
+      throw new HttpError(409, "Cannot rerun while the workflow run is active");
+    }
+    if (run.status === "cancelled") {
+      this.requestStopActiveChildren(runId);
+      await this.waitForRunIdle(runId, 5000);
+    }
+    if (this.activeExecutions.has(runId) || (this.activeChildren.get(runId)?.size || 0) > 0) {
+      throw new HttpError(409, "Wait for the cancelled process to finish before rerunning");
+    }
+    if (!run.items?.length) {
+      throw new HttpError(400, "Rerun from step is available for batch runs only");
+    }
+
+    const workflow = await WorkflowModel.findOne({ _id: run.workflowId, userId }).lean();
+    if (!workflow) {
+      throw new HttpError(404, "Workflow not found");
+    }
+
+    const parsedGraph = repairWorkflowGraphHandles(workflowGraphSchema.parse({ nodes: workflow.nodes, edges: workflow.edges }));
+    const executionOrder = this.resolveExecutionOrder(parsedGraph.nodes, parsedGraph.edges);
+    const startIndex = executionOrder.findIndex((node) => node.id === nodeId);
+    if (startIndex === -1) {
+      throw new HttpError(400, "Selected node is not in the workflow");
+    }
+
+    const itemIndex = itemId
+      ? run.items.findIndex((item) => item.itemId === itemId)
+      : run.items.length === 1
+        ? 0
+        : -1;
+    if (itemIndex === -1) {
+      throw new HttpError(400, "Batch item is required for rerun");
+    }
+
+    const runItem = run.items[itemIndex];
+    if (!runItem.workingDir) {
+      throw new HttpError(400, "Batch item does not have a working directory");
+    }
+
+    const itemRoot = fileStorageService.resolveRelativePath(runItem.workingDir);
+    const item: PreparedRunItem = {
+      itemId: runItem.itemId,
+      index: runItem.index,
+      label: runItem.label,
+      dirs: {
+        runDir: itemRoot,
+        inputDir: path.join(itemRoot, "input"),
+        outputDir: path.join(itemRoot, "output"),
+        tempDir: path.join(itemRoot, "temp"),
+        logsDir: path.join(itemRoot, "logs")
+      },
+      inputFiles: (runItem.inputFiles || []).map((file) => this.normalizeStoredFile(file)),
+      inputValues: (runItem.inputValues || []).map((value) => ({
+        name: String(value.name),
+        type: "text",
+        value: String(value.value)
+      })),
+      exportDir: runItem.exportDir || undefined
+    };
+
+    const staleOutputPaths = new Set<string>();
+    for (const node of executionOrder.slice(startIndex)) {
+      const outputs = this.buildNodeOutputs(node, item.dirs.outputDir);
+      for (const [name, relativePath] of Object.entries(outputs.relativeByName)) {
+        staleOutputPaths.add(relativePath);
+        await fs.rm(outputs.absoluteByName[name], { force: true }).catch(() => undefined);
+      }
+    }
+
+    const existingItemOutputs = (runItem.outputFiles || [])
+      .map((file) => this.normalizeStoredFile(file))
+      .filter((file) => !staleOutputPaths.has(file.relativePath));
+    const existingRunOutputs = (run.outputFiles || []).map((file) => this.normalizeStoredFile(file)).filter(
+      (file) => file.itemId !== item.itemId || !staleOutputPaths.has(file.relativePath)
+    );
+    const nextSteps = this.stepsForRerun(executionOrder, (runItem.steps || []).map((step) => this.normalizeRunStep(step)), startIndex);
+    this.cancelledRuns.delete(runId);
+
+    await RunModel.updateOne(
+      { _id: runId, userId, [`items.${itemIndex}`]: { $exists: true } },
+      {
+        $set: {
+          status: "running",
+          outputFiles: existingRunOutputs,
+          [`items.${itemIndex}.status`]: "running",
+          [`items.${itemIndex}.startedAt`]: new Date(),
+          [`items.${itemIndex}.outputFiles`]: existingItemOutputs,
+          [`items.${itemIndex}.steps`]: nextSteps
+        },
+        $unset: {
+          finishedAt: "",
+          errorMessage: "",
+          [`items.${itemIndex}.finishedAt`]: "",
+          [`items.${itemIndex}.errorMessage`]: ""
+        }
+      }
+    );
+
+    socketService.emitToRun(runId, "run:status", { runId, itemId: item.itemId, status: "running" });
+
+    void this.executeRerunItem({
+      runId,
+      userId,
+      workflowRunDir: run.workingDir ? fileStorageService.resolveRelativePath(run.workingDir) : path.dirname(item.dirs.runDir),
+      nodes: parsedGraph.nodes,
+      edges: parsedGraph.edges,
+      executionOrder,
+      item,
+      startIndex,
+      existingOutputFiles: existingItemOutputs,
+      params: (run.params || {}) as Record<string, string | number | boolean>
+    });
+
     return RunModel.findOne({ _id: runId, userId }).lean();
   }
 
@@ -332,6 +451,7 @@ class WorkflowRunnerService {
     dirs: RunDirs;
     params: Record<string, string | number | boolean>;
   }) {
+    this.activeExecutions.add(input.runId);
     const semaphores = new Map(
       input.executionOrder.map((node) => [node.id, new Semaphore(Math.max(1, node.toolConfig.maxConcurrent || 1))])
     );
@@ -386,7 +506,139 @@ class WorkflowRunnerService {
       socketService.emitToRun(input.runId, "run:finished", { runId: input.runId, status });
     } finally {
       this.activeChildren.delete(input.runId);
+      this.activeExecutions.delete(input.runId);
       this.cancelledRuns.delete(input.runId);
+    }
+  }
+
+  private async executeRerunItem(input: {
+    runId: string;
+    userId: string;
+    workflowRunDir: string;
+    nodes: WorkflowNode[];
+    edges: WorkflowEdge[];
+    executionOrder: WorkflowNode[];
+    item: PreparedRunItem;
+    startIndex: number;
+    existingOutputFiles: StoredFile[];
+    params: Record<string, string | number | boolean>;
+  }) {
+    this.activeExecutions.add(input.runId);
+    const semaphores = new Map(
+      input.executionOrder.map((node) => [node.id, new Semaphore(Math.max(1, node.toolConfig.maxConcurrent || 1))])
+    );
+
+    try {
+      const initialNodeOutputs = this.reconstructNodeOutputs(input.executionOrder, input.item, input.startIndex);
+      await this.executeRunItem({
+        runId: input.runId,
+        userId: input.userId,
+        nodes: input.nodes,
+        edges: input.edges,
+        executionOrder: input.executionOrder,
+        item: input.item,
+        dirs: {
+          runDir: input.workflowRunDir,
+          inputDir: path.join(input.workflowRunDir, "input"),
+          outputDir: path.join(input.workflowRunDir, "output"),
+          tempDir: path.join(input.workflowRunDir, "temp"),
+          logsDir: path.join(input.workflowRunDir, "logs")
+        },
+        semaphores,
+        params: input.params,
+        startIndex: input.startIndex,
+        initialNodeOutputs,
+        existingOutputFiles: input.existingOutputFiles
+      });
+      await this.finalizeRunAfterRerun(input.runId, input.userId, input.workflowRunDir);
+    } catch (error) {
+      await this.updateItem(input.runId, input.userId, input.item.index, {
+        status: error instanceof CancelledRunError ? "cancelled" : "failed",
+        finishedAt: new Date(),
+        errorMessage: error instanceof Error ? error.message : "Rerun failed"
+      });
+      await this.finalizeRunAfterRerun(input.runId, input.userId, input.workflowRunDir);
+    } finally {
+      this.activeChildren.delete(input.runId);
+      this.activeExecutions.delete(input.runId);
+      this.cancelledRuns.delete(input.runId);
+    }
+  }
+
+  private stepsForRerun(executionOrder: WorkflowNode[], currentSteps: RunStep[], startIndex: number) {
+    return executionOrder.map((node, index): RunStep => {
+      const currentStep = currentSteps[index];
+      if (index < startIndex && currentStep) {
+        return currentStep;
+      }
+      return {
+        nodeId: node.id,
+        label: node.label,
+        status: "waiting"
+      };
+    });
+  }
+
+  private reconstructNodeOutputs(executionOrder: WorkflowNode[], item: PreparedRunItem, startIndex: number) {
+    const nodeOutputs = new Map<string, NodeOutputValues>();
+    const initialFiles = new Map(item.inputFiles.map((file) => [file.name, file.relativePath]));
+    const initialTexts = new Map(item.inputValues.map((value) => [value.name, value.value]));
+
+    for (let index = 0; index < startIndex; index += 1) {
+      const node = executionOrder[index];
+      if (node.type === "fileInput") {
+        nodeOutputs.set(node.id, this.resolveInputNode(node, initialFiles, initialTexts));
+        continue;
+      }
+
+      const outputs = this.buildNodeOutputs(node, item.dirs.outputDir);
+      nodeOutputs.set(node.id, {
+        stepByName: outputs.relativeByName,
+        templateByName: outputs.absoluteByName
+      });
+    }
+
+    return nodeOutputs;
+  }
+
+  private async finalizeRunAfterRerun(runId: string, userId: string, workflowRunDir: string) {
+    const run = await RunModel.findOne({ _id: runId, userId }).lean();
+    if (!run) {
+      return;
+    }
+
+    const items = run.items || [];
+    const outputFiles = items.flatMap((item) => item.outputFiles || []);
+    const status = items.some((item) => item.status === "running" || item.status === "pending")
+      ? "running"
+      : items.some((item) => item.status === "cancelled")
+        ? "cancelled"
+        : items.some((item) => item.status === "failed")
+          ? "failed"
+          : "success";
+    const finished = status !== "running";
+    const errorMessage = status === "failed" ? `${items.filter((item) => item.status === "failed").length} batch item(s) failed` : undefined;
+
+    await RunModel.updateOne(
+      { _id: runId, userId },
+      {
+        $set: {
+          status,
+          outputFiles,
+          ...(finished ? { finishedAt: new Date() } : {}),
+          ...(errorMessage ? { errorMessage } : {})
+        },
+        ...(errorMessage ? {} : { $unset: { errorMessage: "" } })
+      }
+    );
+    await this.writeManifest(runId, workflowRunDir).catch(() => undefined);
+    if (finished) {
+      if (status !== "success") {
+        socketService.emitToRun(runId, "run:error", { runId, status, message: errorMessage });
+      }
+      socketService.emitToRun(runId, "run:finished", { runId, status });
+    } else {
+      socketService.emitToRun(runId, "run:status", { runId, status });
     }
   }
 
@@ -400,11 +652,15 @@ class WorkflowRunnerService {
     dirs: RunDirs;
     semaphores: Map<string, Semaphore>;
     params: Record<string, string | number | boolean>;
+    startIndex?: number;
+    initialNodeOutputs?: Map<string, NodeOutputValues>;
+    existingOutputFiles?: StoredFile[];
   }): Promise<{ status: "success" | "failed" | "cancelled"; outputFiles: StoredFile[] }> {
-    const nodeOutputs = new Map<string, NodeOutputValues>();
+    const startIndex = input.startIndex || 0;
+    const nodeOutputs = new Map<string, NodeOutputValues>(input.initialNodeOutputs || []);
     const initialFiles = new Map(input.item.inputFiles.map((file) => [file.name, file.relativePath]));
     const initialTexts = new Map(input.item.inputValues.map((value) => [value.name, value.value]));
-    const runOutputFiles: StoredFile[] = [];
+    const runOutputFiles: StoredFile[] = [...(input.existingOutputFiles || [])];
 
     await this.updateItem(input.runId, input.userId, input.item.index, {
       status: "running",
@@ -412,9 +668,10 @@ class WorkflowRunnerService {
     });
 
     try {
-      for (const node of input.executionOrder) {
+      for (let orderIndex = startIndex; orderIndex < input.executionOrder.length; orderIndex += 1) {
+        const node = input.executionOrder[orderIndex];
         await this.throwIfCancelled(input.runId);
-        const stepIndex = input.executionOrder.findIndex((candidate) => candidate.id === node.id);
+        const stepIndex = orderIndex;
 
         if (node.type === "fileInput") {
           const fileInputOutputs = this.resolveInputNode(node, initialFiles, initialTexts);
@@ -452,6 +709,7 @@ class WorkflowRunnerService {
         const semaphore = input.semaphores.get(node.id);
         await semaphore?.acquire();
         try {
+          await this.throwIfCancelled(input.runId);
           await this.runNode({
             runId: input.runId,
             userId: input.userId,
@@ -694,6 +952,13 @@ class WorkflowRunnerService {
       emitRunnerLog("stdout", `[runner] cwd: ${input.cwd}\n`);
       emitRunnerLog("stdout", `[runner] command: ${JSON.stringify([input.bin, ...input.args])}\n`);
 
+      if (this.cancelledRuns.has(input.runId)) {
+        emitRunnerLog("stderr", "[runner] command cancelled before start\n");
+        logStream.end();
+        reject(new CancelledRunError());
+        return;
+      }
+
       let child: ChildProcessWithoutNullStreams;
       try {
         child = spawn(input.bin, input.args, {
@@ -769,6 +1034,36 @@ class WorkflowRunnerService {
         }, input.timeoutSeconds * 1000);
       }
     });
+  }
+
+  private requestStopActiveChildren(runId: string) {
+    for (const child of this.activeChildren.get(runId) || []) {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        continue;
+      }
+
+      if (!child.killed) {
+        child.kill("SIGTERM");
+      }
+
+      const forceKillTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL");
+        }
+      }, 2500);
+      forceKillTimer.unref();
+    }
+  }
+
+  private async waitForRunIdle(runId: string, timeoutMs: number) {
+    const deadline = Date.now() + timeoutMs;
+    while (this.activeExecutions.has(runId) || (this.activeChildren.get(runId)?.size || 0) > 0) {
+      if (Date.now() >= deadline) {
+        return false;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return true;
   }
 
   private resolveNodeInputs(
@@ -1042,6 +1337,37 @@ class WorkflowRunnerService {
     }
 
     return ordered;
+  }
+
+  private normalizeStoredFile(value: unknown): StoredFile {
+    const file = (value || {}) as Partial<StoredFile> & { preview?: unknown };
+    return {
+      name: String(file.name || path.basename(String(file.relativePath || "file"))),
+      originalName: file.originalName || undefined,
+      mimeType: file.mimeType || undefined,
+      size: typeof file.size === "number" ? file.size : undefined,
+      relativePath: String(file.relativePath || ""),
+      preview: typeof file.preview === "string" ? (file.preview as StoredFile["preview"]) : undefined,
+      itemId: file.itemId || undefined
+    };
+  }
+
+  private normalizeRunStep(value: unknown): RunStep {
+    const step = (value || {}) as Partial<RunStep>;
+    return {
+      nodeId: String(step.nodeId || ""),
+      label: String(step.label || step.nodeId || "Step"),
+      status: step.status || "waiting",
+      startedAt: step.startedAt || undefined,
+      finishedAt: step.finishedAt || undefined,
+      exitCode: step.exitCode ?? undefined,
+      command: step.command || undefined,
+      args: step.args || undefined,
+      inputs: step.inputs || undefined,
+      outputs: step.outputs || undefined,
+      logPath: step.logPath || undefined,
+      errorMessage: step.errorMessage || undefined
+    };
   }
 
   private async updateStep(runId: string, userId: string, stepIndex: number, partial: Partial<RunStep>) {

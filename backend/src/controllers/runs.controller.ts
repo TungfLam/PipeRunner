@@ -19,6 +19,11 @@ const bulkDeleteRunsSchema = z.object({
   runIds: z.array(z.string().regex(/^[0-9a-fA-F]{24}$/)).min(1).max(200)
 });
 
+const rerunBodySchema = z.object({
+  itemId: z.string().optional(),
+  nodeId: z.string().min(1)
+});
+
 function parseJsonField(value: unknown) {
   if (typeof value !== "string") {
     return value;
@@ -83,6 +88,12 @@ export const getRun = asyncHandler<AuthenticatedRequest>(async (req, res: Respon
 
 export const cancelRun = asyncHandler<AuthenticatedRequest>(async (req, res: Response) => {
   const run = await workflowRunnerService.cancelRun(req.user.id, req.params.runId);
+  res.json({ run });
+});
+
+export const rerunRunFromStep = asyncHandler<AuthenticatedRequest>(async (req, res: Response) => {
+  const body = rerunBodySchema.parse(req.body);
+  const run = await workflowRunnerService.rerunFromNode(req.user.id, req.params.runId, body.nodeId, body.itemId);
   res.json({ run });
 });
 
