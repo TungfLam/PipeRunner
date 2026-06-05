@@ -14,6 +14,7 @@ import TableBody from "@mui/material/TableBody";
 import TableCell from "@mui/material/TableCell";
 import TableHead from "@mui/material/TableHead";
 import TableRow from "@mui/material/TableRow";
+import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Background, Controls, MiniMap, ReactFlow, type Edge, type Node } from "@xyflow/react";
@@ -31,6 +32,50 @@ import { repairWorkflowGraphHandles } from "../utils/workflowHandles";
 
 interface LogResponse {
   logs: Array<{ itemId?: string; itemLabel?: string; nodeId: string; label: string; logPath?: string; log: string }>;
+}
+
+const COMMAND_PREVIEW_LENGTH = 72;
+
+function commandTextForStep(step: RunStep) {
+  return [step.command, ...(step.args || [])].filter(Boolean).join(" ");
+}
+
+function commandPreview(commandText: string) {
+  if (commandText.length <= COMMAND_PREVIEW_LENGTH) {
+    return commandText;
+  }
+  return `${commandText.slice(0, COMMAND_PREVIEW_LENGTH - 4)}....`;
+}
+
+function CommandPreview({ step }: { step: RunStep }) {
+  const commandText = commandTextForStep(step);
+  const preview = commandPreview(commandText);
+  const isTruncated = preview !== commandText;
+
+  if (!commandText) {
+    return <Typography variant="caption" color="text.secondary">-</Typography>;
+  }
+
+  return (
+    <Tooltip
+      arrow
+      placement="top-start"
+      disableHoverListener={!isTruncated}
+      title={
+        <Typography variant="caption" sx={{ fontFamily: "monospace", whiteSpace: "normal", wordBreak: "break-all" }}>
+          {commandText}
+        </Typography>
+      }
+      componentsProps={{ tooltip: { sx: { maxWidth: 900 } } }}
+    >
+      <Typography
+        variant="caption"
+        sx={{ display: "block", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+      >
+        {preview}
+      </Typography>
+    </Tooltip>
+  );
 }
 
 export function RunPage() {
@@ -298,10 +343,8 @@ export function RunPage() {
                 <TableCell>
                   <Chip size="small" label={step.status} sx={{ bgcolor: statusColor(step.status), color: "#fff" }} />
                 </TableCell>
-                <TableCell sx={{ maxWidth: 460 }}>
-                  <Typography variant="caption" sx={{ fontFamily: "monospace" }} noWrap title={[step.command, ...(step.args || [])].filter(Boolean).join(" ")}>
-                    {[step.command, ...(step.args || [])].filter(Boolean).join(" ")}
-                  </Typography>
+                <TableCell sx={{ maxWidth: 520, width: "38%" }}>
+                  <CommandPreview step={step} />
                 </TableCell>
                 <TableCell sx={{ maxWidth: 360 }}>
                   {step.errorMessage && (
