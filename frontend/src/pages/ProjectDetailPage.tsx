@@ -1,15 +1,18 @@
 import AddIcon from "@mui/icons-material/Add";
 import DeleteIcon from "@mui/icons-material/Delete";
+import DownloadIcon from "@mui/icons-material/Download";
 import HistoryIcon from "@mui/icons-material/History";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import UploadFileIcon from "@mui/icons-material/UploadFile";
 import AccountTreeIcon from "@mui/icons-material/AccountTree";
+import Alert from "@mui/material/Alert";
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
 import Chip from "@mui/material/Chip";
 import Divider from "@mui/material/Divider";
 import IconButton from "@mui/material/IconButton";
 import Paper from "@mui/material/Paper";
+import Snackbar from "@mui/material/Snackbar";
 import Stack from "@mui/material/Stack";
 import Table from "@mui/material/Table";
 import TableBody from "@mui/material/TableBody";
@@ -26,6 +29,33 @@ import { api, downloadRelativeFile } from "../api/client";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import type { Project, StoredFile, Workflow, WorkflowRun } from "../types/domain";
 import { readableBytes, statusColor } from "../utils/status";
+
+interface WorkflowExportFile {
+  format: "workflow-app.workflow";
+  version: 1;
+  exportedAt: string;
+  workflow: Pick<Workflow, "name" | "description" | "nodes" | "edges">;
+}
+
+type ImportableWorkflow = Pick<Workflow, "name" | "description" | "nodes" | "edges">;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function extractImportableWorkflow(value: unknown): ImportableWorkflow {
+  const candidate = isRecord(value) && isRecord(value.workflow) ? value.workflow : value;
+  if (!isRecord(candidate) || !Array.isArray(candidate.nodes) || !Array.isArray(candidate.edges)) {
+    throw new Error("Invalid workflow export file.");
+  }
+
+  return {
+    name: typeof candidate.name === "string" ? candidate.name : "Imported workflow",
+    description: typeof candidate.description === "string" ? candidate.description : "",
+    nodes: candidate.nodes as Workflow["nodes"],
+    edges: candidate.edges as Workflow["edges"]
+  };
+}
 
 const exampleNodes: Workflow["nodes"] = [
   {
@@ -116,6 +146,11 @@ export function ProjectDetailPage() {
   const queryClient = useQueryClient();
   const [workflowName, setWorkflowName] = useState("");
   const [workflowToDelete, setWorkflowToDelete] = useState<Workflow | null>(null);
+  const [toast, setToast] = useState<{ open: boolean; severity: "success" | "error"; message: string }>({
+    open: false,
+    severity: "success",
+    message: ""
+  });
 
   const projectQuery = useQuery({
     queryKey: ["project", projectId],
@@ -181,6 +216,57 @@ export function ProjectDetailPage() {
     onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["project-files", projectId] })
   });
 
+  const importWorkflow = useMutation({
+    mutationFn: async (file: File) => {
+      const text = await file.text();
+      const workflowPayload = extractImportableWorkflow(JSON.parse(text));
+
+      const importedName =
+        workflowPayload.name.trim()
+          ? workflowPayload.name.trim()
+          : file.name.replace(/\.json$/i, "") || "Imported workflow";
+
+      return api.post(`/projects/${projectId}/workflows`, {
+        name: `${importedName} imported`,
+        description: typeof workflowPayload.description === "string" ? workflowPayload.description : "",
+        nodes: workflowPayload.nodes,
+        edges: workflowPayload.edges
+      });
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["workflows", projectId] });
+      setToast({ open: true, severity: "success", message: "Workflow imported." });
+    },
+    onError: (error) => {
+      setToast({
+        open: true,
+        severity: "error",
+        message: error instanceof Error ? error.message : "Failed to import workflow."
+      });
+    }
+  });
+
+  const exportWorkflow = (workflow: Workflow) => {
+    const payload: WorkflowExportFile = {
+      format: "workflow-app.workflow",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      workflow: {
+        name: workflow.name,
+        description: workflow.description || "",
+        nodes: workflow.nodes,
+        edges: workflow.edges
+      }
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${workflow.name.replace(/[^a-zA-Z0-9._-]+/g, "_") || "workflow"}.workflow.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <Stack spacing={3}>
       <Stack direction="row" alignItems="flex-start" spacing={2}>
@@ -213,6 +299,21 @@ export function ProjectDetailPage() {
             disabled={createWorkflow.isPending}
           >
             Blank
+          </Button>
+          <Button startIcon={<UploadFileIcon />} variant="outlined" component="label" disabled={importWorkflow.isPending}>
+            Import
+            <input
+              hidden
+              type="file"
+              accept="application/json,.json"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                event.target.value = "";
+                if (file) {
+                  importWorkflow.mutate(file);
+                }
+              }}
+            />
           </Button>
           <Button
             startIcon={<PlayArrowIcon />}
@@ -260,6 +361,11 @@ export function ProjectDetailPage() {
                   <TableCell>{workflow.nodes.length}</TableCell>
                   <TableCell>{new Date(workflow.updatedAt).toLocaleString()}</TableCell>
                   <TableCell align="right">
+                    <Tooltip title="Export workflow">
+                      <IconButton onClick={() => exportWorkflow(workflow)}>
+                        <DownloadIcon />
+                      </IconButton>
+                    </Tooltip>
                     <Tooltip title="Run history">
                       <IconButton component={RouterLink} to={`/workflows/${workflow._id}/runs`}>
                         <HistoryIcon />
@@ -361,6 +467,21 @@ export function ProjectDetailPage() {
         onCancel={() => setWorkflowToDelete(null)}
         onConfirm={() => workflowToDelete && deleteWorkflow.mutate(workflowToDelete._id)}
       />
+      <Snackbar
+        open={toast.open}
+        autoHideDuration={3000}
+        onClose={() => setToast((current) => ({ ...current, open: false }))}
+        anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+      >
+        <Alert
+          severity={toast.severity}
+          variant="filled"
+          onClose={() => setToast((current) => ({ ...current, open: false }))}
+          sx={{ width: "100%" }}
+        >
+          {toast.message}
+        </Alert>
+      </Snackbar>
     </Stack>
   );
 }
