@@ -29,7 +29,7 @@ import { statusColor } from "../utils/status";
 import { repairWorkflowGraphHandles } from "../utils/workflowHandles";
 
 interface LogResponse {
-  logs: Array<{ nodeId: string; label: string; logPath?: string; log: string }>;
+  logs: Array<{ itemId?: string; itemLabel?: string; nodeId: string; label: string; logPath?: string; log: string }>;
 }
 
 export function RunPage() {
@@ -38,6 +38,7 @@ export function RunPage() {
   const token = useAuthStore((state) => state.token);
   const queryClient = useQueryClient();
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
   const [liveLogs, setLiveLogs] = useState<Record<string, string>>({});
   const nodeTypes = useMemo(() => ({ tool: ToolNode }), []);
 
@@ -72,10 +73,11 @@ export function RunPage() {
     if (!token || !runId) return;
     const socket = io(API_URL, { auth: { token } });
     socket.emit("run:join", runId);
-    socket.on("step:log", (payload: { nodeId: string; message: string }) => {
+    socket.on("step:log", (payload: { itemId?: string; nodeId: string; message: string }) => {
+      const key = `${payload.itemId || ""}:${payload.nodeId}`;
       setLiveLogs((current) => ({
         ...current,
-        [payload.nodeId]: `${current[payload.nodeId] || ""}${payload.message}`
+        [key]: `${current[key] || ""}${payload.message}`
       }));
     });
     const invalidate = () => {
@@ -93,13 +95,21 @@ export function RunPage() {
     };
   }, [queryClient, runId, token]);
 
+  const selectedItem =
+    (selectedItemId && runQuery.data?.items?.find((item) => item.itemId === selectedItemId)) ||
+    runQuery.data?.items?.find((item) => item.status === "running") ||
+    runQuery.data?.items?.find((item) => item.status === "failed") ||
+    runQuery.data?.items?.[0] ||
+    null;
+  const activeSteps = selectedItem?.steps?.length ? selectedItem.steps : runQuery.data?.steps || [];
+
   const stepsByNode = useMemo(() => {
     const map = new Map<string, RunStep>();
-    for (const step of runQuery.data?.steps || []) {
+    for (const step of activeSteps) {
       map.set(step.nodeId, step);
     }
     return map;
-  }, [runQuery.data?.steps]);
+  }, [activeSteps]);
 
   const graph = useMemo(() => {
     const workflow = workflowQuery.data;
@@ -136,25 +146,29 @@ export function RunPage() {
   const baseLogs = useMemo(() => {
     const map: Record<string, string> = {};
     for (const item of logsQuery.data?.logs || []) {
-      map[item.nodeId] = item.log;
+      map[`${item.itemId || ""}:${item.nodeId}`] = item.log;
     }
     return map;
   }, [logsQuery.data]);
 
   const selectedStep =
     (selectedNodeId && stepsByNode.get(selectedNodeId)) ||
-    runQuery.data?.steps?.find((step) => step.status === "running") ||
-    runQuery.data?.steps?.find((step) => step.status === "failed") ||
-    runQuery.data?.steps?.[0];
+    activeSteps.find((step) => step.status === "running") ||
+    activeSteps.find((step) => step.status === "failed") ||
+    activeSteps[0];
   const selectedNode =
     selectedStep && graph.nodes.find((node) => node.id === selectedStep.nodeId)
       ? graph.nodes.find((node) => node.id === selectedStep.nodeId)?.data.workflowNode || null
       : null;
+  const selectedLogKey = selectedStep ? `${selectedItem?.itemId || ""}:${selectedStep.nodeId}` : "";
   const selectedLogs = selectedStep
-    ? (baseLogs[selectedStep.nodeId] || "").includes(liveLogs[selectedStep.nodeId] || "")
-      ? baseLogs[selectedStep.nodeId] || liveLogs[selectedStep.nodeId] || ""
-      : `${baseLogs[selectedStep.nodeId] || ""}${liveLogs[selectedStep.nodeId] || ""}`
+    ? (baseLogs[selectedLogKey] || "").includes(liveLogs[selectedLogKey] || "")
+      ? baseLogs[selectedLogKey] || liveLogs[selectedLogKey] || ""
+      : `${baseLogs[selectedLogKey] || ""}${liveLogs[selectedLogKey] || ""}`
     : "";
+  const visibleInputFiles = selectedItem?.inputFiles || runQuery.data?.inputFiles || [];
+  const visibleInputValues = selectedItem?.inputValues || [];
+  const visibleOutputFiles = selectedItem?.outputFiles || runQuery.data?.outputFiles || [];
 
   if (!runQuery.data) {
     return <Typography>Loading run...</Typography>;
@@ -197,6 +211,57 @@ export function RunPage() {
         <Alert severity={runQuery.data.status === "failed" ? "error" : "warning"}>{runQuery.data.errorMessage}</Alert>
       )}
 
+      {Boolean(runQuery.data.items?.length) && (
+        <Paper sx={{ overflow: "hidden" }} elevation={1}>
+          <Table size="small">
+            <TableHead>
+              <TableRow>
+                <TableCell>Batch Item</TableCell>
+                <TableCell>Status</TableCell>
+                <TableCell>Inputs</TableCell>
+                <TableCell>Outputs</TableCell>
+                <TableCell>Error</TableCell>
+                <TableCell align="right">View</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {(runQuery.data.items || []).map((item) => (
+                <TableRow key={item.itemId} selected={selectedItem?.itemId === item.itemId} hover>
+                  <TableCell>
+                    <Typography variant="body2" sx={{ fontWeight: 700 }} noWrap title={item.label}>
+                      {item.index + 1}. {item.label}
+                    </Typography>
+                  </TableCell>
+                  <TableCell>
+                    <Chip size="small" label={item.status} sx={{ bgcolor: statusColor(item.status), color: "#fff" }} />
+                  </TableCell>
+                  <TableCell>{(item.inputFiles?.length || 0) + (item.inputValues?.length || 0)}</TableCell>
+                  <TableCell>{item.outputFiles?.length || 0}</TableCell>
+                  <TableCell sx={{ maxWidth: 360 }}>
+                    {item.errorMessage && (
+                      <Typography variant="caption" color="error" noWrap title={item.errorMessage}>
+                        {item.errorMessage}
+                      </Typography>
+                    )}
+                  </TableCell>
+                  <TableCell align="right">
+                    <Button
+                      size="small"
+                      onClick={() => {
+                        setSelectedItemId(item.itemId);
+                        setSelectedNodeId(null);
+                      }}
+                    >
+                      View
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Paper>
+      )}
+
       <Paper sx={{ overflow: "hidden" }} elevation={1}>
         <Table size="small">
           <TableHead>
@@ -209,7 +274,7 @@ export function RunPage() {
             </TableRow>
           </TableHead>
           <TableBody>
-            {(runQuery.data.steps || []).map((step) => (
+            {activeSteps.map((step) => (
               <TableRow key={step.nodeId} selected={selectedStep?.nodeId === step.nodeId} hover>
                 <TableCell>{step.label}</TableCell>
                 <TableCell>
@@ -315,10 +380,23 @@ export function RunPage() {
             Inputs
           </Typography>
           <Stack spacing={1.5}>
-            {(runQuery.data.inputFiles || []).map((file) => (
+            {visibleInputValues.map((value) => (
+              <Box
+                key={`${value.name}-${value.value}`}
+                sx={{ border: "1px solid", borderColor: "divider", borderRadius: 1, p: 1.25 }}
+              >
+                <Typography variant="caption" color="text.secondary">
+                  {value.name}
+                </Typography>
+                <Typography variant="body2" sx={{ fontFamily: "monospace", wordBreak: "break-all" }}>
+                  {value.value}
+                </Typography>
+              </Box>
+            ))}
+            {visibleInputFiles.map((file) => (
               <FilePreview key={file.relativePath} file={file} />
             ))}
-            {!runQuery.data.inputFiles?.length && (
+            {!visibleInputFiles.length && !visibleInputValues.length && (
               <Typography variant="body2" color="text.secondary">
                 No input files recorded.
               </Typography>
@@ -331,10 +409,10 @@ export function RunPage() {
             Outputs
           </Typography>
           <Stack spacing={1.5}>
-            {(runQuery.data.outputFiles || []).map((file) => (
+            {visibleOutputFiles.map((file) => (
               <FilePreview key={file.relativePath} file={file} />
             ))}
-            {!runQuery.data.outputFiles?.length && (
+            {!visibleOutputFiles.length && (
               <Typography variant="body2" color="text.secondary">
                 No outputs yet.
               </Typography>

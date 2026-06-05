@@ -9,7 +9,8 @@ import { asyncHandler } from "../utils/asyncHandler";
 import { HttpError } from "../utils/httpError";
 
 const runBodySchema = z.object({
-  inputs: z.record(z.string(), z.string()).optional().default({}),
+  inputs: z.record(z.string(), z.union([z.string(), z.array(z.string())])).optional().default({}),
+  textInputs: z.record(z.string(), z.array(z.string())).optional().default({}),
   params: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional().default({})
 });
 
@@ -30,12 +31,14 @@ function parseJsonField(value: unknown) {
 export const createRun = asyncHandler<AuthenticatedRequest>(async (req, res: Response) => {
   const body = runBodySchema.parse({
     inputs: parseJsonField(req.body.inputs),
+    textInputs: parseJsonField(req.body.textInputs),
     params: parseJsonField(req.body.params)
   });
   const run = await workflowRunnerService.startRun({
     userId: req.user.id,
     workflowId: req.params.workflowId,
     selectedInputs: body.inputs,
+    textInputs: body.textInputs,
     uploadedFiles: Array.isArray(req.files) ? req.files : [],
     params: body.params
   });
@@ -117,19 +120,28 @@ export const getRunLogs = asyncHandler<AuthenticatedRequest>(async (req, res: Re
     throw new HttpError(404, "Run not found");
   }
 
+  const logSources = run.items?.length
+    ? run.items.flatMap((item) =>
+        (item.steps || [])
+          .filter((step) => !req.query.nodeId || step.nodeId === req.query.nodeId)
+          .filter((step) => !req.query.itemId || item.itemId === req.query.itemId)
+          .map((step) => ({ itemId: item.itemId, itemLabel: item.label, step, baseDir: item.workingDir }))
+      )
+    : (run.steps || [])
+        .filter((step) => !req.query.nodeId || step.nodeId === req.query.nodeId)
+        .map((step) => ({ itemId: undefined, itemLabel: undefined, step, baseDir: run.workingDir }));
+
   const logs = await Promise.all(
-    (run.steps || [])
-      .filter((step) => !req.query.nodeId || step.nodeId === req.query.nodeId)
-      .map(async (step) => {
-        const guessedLogPath = run.workingDir ? `${run.workingDir}/logs/${sanitizeFileName(step.nodeId)}.log` : undefined;
-        const logPath = step.logPath || guessedLogPath;
-        if (!logPath) {
-          return { nodeId: step.nodeId, label: step.label, log: "" };
-        }
-        fileStorageService.assertUserOwnsPath(req.user.id, logPath);
-        const log = await fileStorageService.readText(logPath, 5_000_000).catch(() => "");
-        return { nodeId: step.nodeId, label: step.label, logPath, log };
-      })
+    logSources.map(async (source) => {
+      const guessedLogPath = source.baseDir ? `${source.baseDir}/logs/${sanitizeFileName(source.step.nodeId)}.log` : undefined;
+      const logPath = source.step.logPath || guessedLogPath;
+      if (!logPath) {
+        return { itemId: source.itemId, itemLabel: source.itemLabel, nodeId: source.step.nodeId, label: source.step.label, log: "" };
+      }
+      fileStorageService.assertUserOwnsPath(req.user.id, logPath);
+      const log = await fileStorageService.readText(logPath, 5_000_000).catch(() => "");
+      return { itemId: source.itemId, itemLabel: source.itemLabel, nodeId: source.step.nodeId, label: source.step.label, logPath, log };
+    })
   );
 
   res.json({ logs });

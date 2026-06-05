@@ -14,7 +14,7 @@ const workflowInputSchema = new Schema(
 const workflowOutputSchema = new Schema(
   {
     name: { type: String, required: true },
-    type: { type: String, enum: ["file"], default: "file" },
+    type: { type: String, enum: ["file", "text"], default: "file" },
     flag: { type: String },
     extension: { type: String },
     preview: { type: String, enum: ["video", "audio", "text", "json", "image"] }
@@ -36,7 +36,8 @@ const workflowNodeSchema = new Schema(
       args: [{ type: String }],
       workingDir: { type: String },
       env: { type: Schema.Types.Mixed, default: {} },
-      timeoutSeconds: { type: Number }
+      timeoutSeconds: { type: Number },
+      maxConcurrent: { type: Number }
     },
     inputs: [workflowInputSchema],
     outputs: [workflowOutputSchema],

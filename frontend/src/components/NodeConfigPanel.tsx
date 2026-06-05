@@ -257,13 +257,13 @@ export function NodeConfigPanel({ node, step, logs, readOnly = false, onClose, o
     const nextInputs = node.inputs.map((input, inputIndex) =>
       inputIndex === index
         ? {
-            ...input,
-            ...patch,
-            name:
-              patch.flag !== undefined && shouldAutoUpdateName(input.name, input.flag, `input${index + 1}`)
-                ? nameFromFlag(patch.flag, `input${index + 1}`)
-                : patch.name ?? input.name
-          }
+          ...input,
+          ...patch,
+          name:
+            patch.flag !== undefined && shouldAutoUpdateName(input.name, input.flag, `input${index + 1}`)
+              ? nameFromFlag(patch.flag, `input${index + 1}`)
+              : patch.name ?? input.name
+        }
         : input
     );
     emitChange({ inputs: nextInputs }, nextInputs);
@@ -273,14 +273,14 @@ export function NodeConfigPanel({ node, step, logs, readOnly = false, onClose, o
     const nextOutputs = node.outputs.map((output, outputIndex) =>
       outputIndex === index
         ? {
-            ...output,
-            ...patch,
-            name:
-              patch.flag !== undefined && shouldAutoUpdateName(output.name, output.flag, `output${index + 1}`)
-                ? nameFromFlag(patch.flag, `output${index + 1}`)
-                : patch.name ?? output.name,
-            preview: patch.extension && !patch.preview ? previewForExtension(patch.extension) : patch.preview || output.preview
-          }
+          ...output,
+          ...patch,
+          name:
+            patch.flag !== undefined && shouldAutoUpdateName(output.name, output.flag, `output${index + 1}`)
+              ? nameFromFlag(patch.flag, `output${index + 1}`)
+              : patch.name ?? output.name,
+          preview: patch.extension && !patch.preview ? previewForExtension(patch.extension) : patch.preview || output.preview
+        }
         : output
     );
     emitChange({ outputs: nextOutputs }, undefined, nextOutputs);
@@ -369,6 +369,23 @@ export function NodeConfigPanel({ node, step, logs, readOnly = false, onClose, o
               size="small"
               fullWidth
             />
+            <TextField
+              label="Max concurrent runs"
+              type="number"
+              value={node.toolConfig.maxConcurrent || 1}
+              disabled={readOnly}
+              onChange={(event) =>
+                emitChange({
+                  toolConfig: {
+                    ...node.toolConfig,
+                    maxConcurrent: event.target.value ? Math.max(1, Number(event.target.value)) : undefined
+                  }
+                })
+              }
+              size="small"
+              fullWidth
+              helperText="Per-tool batch limit."
+            />
           </>
         )}
 
@@ -431,14 +448,28 @@ export function NodeConfigPanel({ node, step, logs, readOnly = false, onClose, o
                   </Stack>
                   <Stack direction="row" spacing={1} alignItems="center">
                     <TextField
-                      label="Accepted extensions"
-                      placeholder="mp4,mov,mkv"
-                      value={(input.accept || []).join(",")}
+                      label="Input type"
+                      select
+                      value={input.type || "file"}
                       disabled={readOnly}
-                      onChange={(event) => updateInput(index, { accept: parseCsv(event.target.value) })}
+                      onChange={(event) => updateInput(index, { type: event.target.value as WorkflowInputDefinition["type"] })}
                       size="small"
                       sx={{ flex: 1 }}
-                    />
+                    >
+                      <MenuItem value="file">File</MenuItem>
+                      <MenuItem value="text">Text</MenuItem>
+                    </TextField>
+                    {(input.type || "file") === "file" && (
+                      <TextField
+                        label="Accepted extensions"
+                        placeholder="mp4,mov,mkv"
+                        value={(input.accept || []).join(",")}
+                        disabled={readOnly}
+                        onChange={(event) => updateInput(index, { accept: parseCsv(event.target.value) })}
+                        size="small"
+                        sx={{ flex: 1 }}
+                      />
+                    )}
                     <FormControlLabel
                       control={
                         <Checkbox
@@ -488,15 +519,30 @@ export function NodeConfigPanel({ node, step, logs, readOnly = false, onClose, o
                   sx={{ flex: 1 }}
                   helperText="Auto from CLI flag; editable."
                 />
-                <TextField
-                  label={isFileInput ? "CLI flag" : "CLI flag"}
-                  placeholder="--mp4-output"
-                  value={output.flag || ""}
-                  disabled={readOnly}
-                  onChange={(event) => updateOutput(index, { flag: event.target.value })}
-                  size="small"
-                  sx={{ flex: 1 }}
-                />
+                {isFileInput ? (
+                  <TextField
+                    label="Input type"
+                    select
+                    value={output.type || "file"}
+                    disabled={readOnly}
+                    onChange={(event) => updateOutput(index, { type: event.target.value as "file" | "text" })}
+                    size="small"
+                    sx={{ flex: 1 }}
+                  >
+                    <MenuItem value="file">File</MenuItem>
+                    <MenuItem value="text">Text</MenuItem>
+                  </TextField>
+                ) : (
+                  <TextField
+                    label="CLI flag"
+                    placeholder="--mp4-output"
+                    value={output.flag || ""}
+                    disabled={readOnly}
+                    onChange={(event) => updateOutput(index, { flag: event.target.value })}
+                    size="small"
+                    sx={{ flex: 1 }}
+                  />
+                )}
                 {!readOnly && (
                   <Tooltip title="Remove output">
                     <IconButton
@@ -511,33 +557,35 @@ export function NodeConfigPanel({ node, step, logs, readOnly = false, onClose, o
                   </Tooltip>
                 )}
               </Stack>
-              <Stack direction="row" spacing={1}>
-                <TextField
-                  label="Extension"
-                  placeholder="mp4"
-                  value={output.extension || ""}
-                  disabled={readOnly}
-                  onChange={(event) => updateOutput(index, { extension: event.target.value.replace(/^\./, "") })}
-                  size="small"
-                  sx={{ flex: 1 }}
-                />
-                <TextField
-                  label="Preview"
-                  select
-                  value={output.preview || ""}
-                  disabled={readOnly}
-                  onChange={(event) => updateOutput(index, { preview: event.target.value as PreviewType })}
-                  size="small"
-                  sx={{ flex: 1 }}
-                >
-                  <MenuItem value="">Auto</MenuItem>
-                  {previewTypes.map((preview) => (
-                    <MenuItem key={preview} value={preview}>
-                      {preview}
-                    </MenuItem>
-                  ))}
-                </TextField>
-              </Stack>
+              {(output.type || "file") === "file" && (
+                <Stack direction="row" spacing={1}>
+                  <TextField
+                    label={isFileInput ? "Accepted extension" : "Extension"}
+                    placeholder="mp4"
+                    value={output.extension || ""}
+                    disabled={readOnly}
+                    onChange={(event) => updateOutput(index, { extension: event.target.value.replace(/^\./, "") })}
+                    size="small"
+                    sx={{ flex: 1 }}
+                  />
+                  <TextField
+                    label="Preview"
+                    select
+                    value={output.preview || ""}
+                    disabled={readOnly}
+                    onChange={(event) => updateOutput(index, { preview: event.target.value as PreviewType })}
+                    size="small"
+                    sx={{ flex: 1 }}
+                  >
+                    <MenuItem value="">Auto</MenuItem>
+                    {previewTypes.map((preview) => (
+                      <MenuItem key={preview} value={preview}>
+                        {preview}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                </Stack>
+              )}
             </Stack>
           </Box>
         ))}

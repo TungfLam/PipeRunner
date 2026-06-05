@@ -7,7 +7,7 @@ import { Types } from "mongoose";
 import { ProjectModel } from "../models/Project";
 import { RunModel } from "../models/Run";
 import { WorkflowModel } from "../models/Workflow";
-import type { RunStep, StoredFile, WorkflowEdge, WorkflowNode, WorkflowOutputDefinition } from "../types/domain";
+import type { RunInputValue, RunItem, RunStep, StoredFile, WorkflowEdge, WorkflowNode, WorkflowOutputDefinition } from "../types/domain";
 import { HttpError } from "../utils/httpError";
 import { previewTypeForPath } from "../utils/preview";
 import { workflowGraphSchema } from "../utils/validation";
@@ -18,7 +18,8 @@ import { socketService } from "./socket.service";
 interface StartRunInput {
   userId: string;
   workflowId: string;
-  selectedInputs: Record<string, string>;
+  selectedInputs: Record<string, string | string[]>;
+  textInputs: Record<string, string[]>;
   uploadedFiles: Express.Multer.File[];
   params: Record<string, string | number | boolean>;
 }
@@ -30,6 +31,22 @@ interface RunDirs {
   tempDir: string;
   logsDir: string;
 }
+
+interface PreparedRunItem {
+  itemId: string;
+  index: number;
+  label: string;
+  dirs: RunDirs;
+  inputFiles: StoredFile[];
+  inputValues: RunInputValue[];
+}
+
+interface ResolvedValues {
+  stepByName: Record<string, string>;
+  templateByName: Record<string, string>;
+}
+
+interface NodeOutputValues extends ResolvedValues {}
 
 class CancelledRunError extends Error {
   constructor() {
@@ -46,8 +63,32 @@ class CommandFailedError extends Error {
   }
 }
 
+class Semaphore {
+  private active = 0;
+  private queue: Array<() => void> = [];
+
+  constructor(private readonly limit: number) {}
+
+  async acquire() {
+    if (this.active < this.limit) {
+      this.active += 1;
+      return;
+    }
+    await new Promise<void>((resolve) => this.queue.push(resolve));
+    this.active += 1;
+  }
+
+  release() {
+    this.active = Math.max(0, this.active - 1);
+    const next = this.queue.shift();
+    if (next) {
+      next();
+    }
+  }
+}
+
 class WorkflowRunnerService {
-  private activeChildren = new Map<string, ChildProcessWithoutNullStreams>();
+  private activeChildren = new Map<string, Set<ChildProcessWithoutNullStreams>>();
   private cancelledRuns = new Set<string>();
 
   async startRun(input: StartRunInput) {
@@ -84,7 +125,26 @@ class WorkflowRunnerService {
     socketService.emitToRun(runId, "run:created", { runId, status: "pending" });
 
     const dirs = await fileStorageService.createRunDirs(input.userId, String(workflow.projectId), runId);
-    const inputFiles = await this.prepareInputFiles(input.userId, dirs.inputDir, input.selectedInputs, input.uploadedFiles);
+    const items = await this.prepareRunItems({
+      userId: input.userId,
+      runDir: dirs.runDir,
+      selectedInputs: input.selectedInputs,
+      textInputs: input.textInputs,
+      uploadedFiles: input.uploadedFiles,
+      steps
+    });
+    const inputFiles = items.flatMap((item) => item.inputFiles);
+    const runItems: RunItem[] = items.map((item) => ({
+      itemId: item.itemId,
+      index: item.index,
+      label: item.label,
+      status: "pending",
+      workingDir: fileStorageService.relativeFromAbsolute(item.dirs.runDir),
+      inputFiles: item.inputFiles,
+      inputValues: item.inputValues,
+      outputFiles: [],
+      steps: steps.map((step) => ({ ...step }))
+    }));
 
     await RunModel.updateOne(
       { _id: runId, userId: input.userId },
@@ -93,7 +153,8 @@ class WorkflowRunnerService {
           status: "running",
           startedAt: new Date(),
           workingDir: fileStorageService.relativeFromAbsolute(dirs.runDir),
-          inputFiles
+          inputFiles,
+          items: runItems
         }
       }
     );
@@ -105,7 +166,7 @@ class WorkflowRunnerService {
       nodes: parsedGraph.nodes,
       edges: parsedGraph.edges,
       executionOrder,
-      inputFiles,
+      items,
       dirs,
       params: input.params
     });
@@ -120,9 +181,10 @@ class WorkflowRunnerService {
     }
 
     this.cancelledRuns.add(runId);
-    const child = this.activeChildren.get(runId);
-    if (child && !child.killed) {
-      child.kill("SIGTERM");
+    for (const child of this.activeChildren.get(runId) || []) {
+      if (!child.killed) {
+        child.kill("SIGTERM");
+      }
     }
 
     const steps = (run.steps || []).map((step) =>
@@ -130,35 +192,119 @@ class WorkflowRunnerService {
         ? { ...step, status: "cancelled", finishedAt: new Date(), errorMessage: "Run cancelled" }
         : step
     );
+    const items = (run.items || []).map((item) => ({
+      ...item,
+      status: ["pending", "running"].includes(item.status) ? "cancelled" : item.status,
+      finishedAt: item.finishedAt || new Date(),
+      errorMessage: item.errorMessage || "Run cancelled",
+      steps: (item.steps || []).map((step) =>
+        ["waiting", "running"].includes(step.status)
+          ? { ...step, status: "cancelled", finishedAt: new Date(), errorMessage: "Run cancelled" }
+          : step
+      )
+    }));
 
     await RunModel.updateOne(
       { _id: runId, userId },
-      { $set: { status: "cancelled", finishedAt: new Date(), steps, errorMessage: "Run cancelled" } }
+      { $set: { status: "cancelled", finishedAt: new Date(), steps, items, errorMessage: "Run cancelled" } }
     );
     socketService.emitToRun(runId, "run:finished", { runId, status: "cancelled" });
     return RunModel.findOne({ _id: runId, userId }).lean();
   }
 
-  private async prepareInputFiles(
-    userId: string,
-    inputDir: string,
-    selectedInputs: Record<string, string>,
-    uploadedFiles: Express.Multer.File[]
-  ): Promise<StoredFile[]> {
-    const inputFiles: StoredFile[] = [];
+  private async prepareRunItems(input: {
+    userId: string;
+    runDir: string;
+    selectedInputs: Record<string, string | string[]>;
+    textInputs: Record<string, string[]>;
+    uploadedFiles: Express.Multer.File[];
+    steps: RunStep[];
+  }): Promise<PreparedRunItem[]> {
+    type BatchValue =
+      | { kind: "upload"; inputName: string; file: Express.Multer.File }
+      | { kind: "selected"; inputName: string; relativePath: string }
+      | { kind: "text"; inputName: string; value: string };
 
-    for (const [inputName, relativePath] of Object.entries(selectedInputs)) {
-      if (relativePath) {
-        inputFiles.push(await fileStorageService.copySelectedInput(userId, relativePath, inputDir, inputName));
+    const valuesByInput = new Map<string, BatchValue[]>();
+    const appendValue = (inputName: string, value: BatchValue) => {
+      valuesByInput.set(inputName, [...(valuesByInput.get(inputName) || []), value]);
+    };
+
+    for (const file of input.uploadedFiles) {
+      const inputName = file.fieldname === "files" ? path.parse(file.originalname).name : file.fieldname;
+      appendValue(inputName, { kind: "upload", inputName, file });
+    }
+
+    for (const [inputName, selectedValue] of Object.entries(input.selectedInputs || {})) {
+      const selectedPaths = (Array.isArray(selectedValue) ? selectedValue : [selectedValue]).filter(Boolean);
+      for (const relativePath of selectedPaths) {
+        appendValue(inputName, { kind: "selected", inputName, relativePath });
       }
     }
 
-    for (const file of uploadedFiles) {
-      const inputName = file.fieldname === "files" ? path.parse(file.originalname).name : file.fieldname;
-      inputFiles.push(await fileStorageService.saveRunUpload(inputDir, inputName, file));
+    for (const [inputName, textValues] of Object.entries(input.textInputs || {})) {
+      for (const value of (Array.isArray(textValues) ? textValues : [textValues]).map((item) => String(item).trim()).filter(Boolean)) {
+        appendValue(inputName, { kind: "text", inputName, value });
+      }
     }
 
-    return inputFiles;
+    const batchSize = Math.max(1, ...Array.from(valuesByInput.values()).map((values) => values.length));
+    for (const [inputName, values] of valuesByInput.entries()) {
+      if (values.length !== 1 && values.length !== batchSize) {
+        throw new HttpError(400, `Input "${inputName}" has ${values.length} values, but this batch needs 1 or ${batchSize}`);
+      }
+    }
+
+    const items: PreparedRunItem[] = [];
+    for (let index = 0; index < batchSize; index += 1) {
+      const itemId = `item_${String(index + 1).padStart(3, "0")}`;
+      const itemRoot = path.join(input.runDir, "items", itemId);
+      const dirs: RunDirs = {
+        runDir: itemRoot,
+        inputDir: path.join(itemRoot, "input"),
+        outputDir: path.join(itemRoot, "output"),
+        tempDir: path.join(itemRoot, "temp"),
+        logsDir: path.join(itemRoot, "logs")
+      };
+      await Promise.all(Object.values(dirs).map((dir) => fs.mkdir(dir, { recursive: true })));
+
+      const inputFiles: StoredFile[] = [];
+      const inputValues: RunInputValue[] = [];
+      const labels: string[] = [];
+
+      for (const values of valuesByInput.values()) {
+        const value = values[values.length === 1 ? 0 : index];
+        if (!value) continue;
+
+        if (value.kind === "upload") {
+          const storedFile = await fileStorageService.saveRunUpload(dirs.inputDir, value.inputName, value.file);
+          inputFiles.push({ ...storedFile, itemId });
+          labels.push(value.file.originalname);
+          continue;
+        }
+
+        if (value.kind === "selected") {
+          const storedFile = await fileStorageService.copySelectedInput(input.userId, value.relativePath, dirs.inputDir, value.inputName);
+          inputFiles.push({ ...storedFile, itemId });
+          labels.push(path.basename(value.relativePath));
+          continue;
+        }
+
+        inputValues.push({ name: value.inputName, type: "text", value: value.value });
+        labels.push(value.value.length > 42 ? `${value.value.slice(0, 42)}...` : value.value);
+      }
+
+      items.push({
+        itemId,
+        index,
+        label: labels.filter(Boolean).join(", ") || `Item ${index + 1}`,
+        dirs,
+        inputFiles,
+        inputValues
+      });
+    }
+
+    return items;
   }
 
   private async executeRun(input: {
@@ -167,102 +313,43 @@ class WorkflowRunnerService {
     nodes: WorkflowNode[];
     edges: WorkflowEdge[];
     executionOrder: WorkflowNode[];
-    inputFiles: StoredFile[];
+    items: PreparedRunItem[];
     dirs: RunDirs;
     params: Record<string, string | number | boolean>;
   }) {
-    const nodeOutputs = new Map<string, Record<string, string>>();
-    const nodeOutputFiles = new Map<string, StoredFile[]>();
-    const initialInputs = new Map(input.inputFiles.map((file) => [file.name, file.relativePath]));
-    const runOutputFiles: StoredFile[] = [];
+    const semaphores = new Map(
+      input.executionOrder.map((node) => [node.id, new Semaphore(Math.max(1, node.toolConfig.maxConcurrent || 1))])
+    );
 
     try {
-      for (const node of input.executionOrder) {
-        await this.throwIfCancelled(input.runId);
-        const stepIndex = input.executionOrder.findIndex((candidate) => candidate.id === node.id);
-        if (node.type === "fileInput") {
-          let fileInputOutputs: Record<string, string>;
-          try {
-            fileInputOutputs = this.resolveFileInputNode(node, initialInputs);
-          } catch (error) {
-            await this.updateStep(input.runId, input.userId, stepIndex, {
-              status: "failed",
-              startedAt: new Date(),
-              finishedAt: new Date(),
-              errorMessage: error instanceof Error ? error.message : "Input module failed"
-            });
-            socketService.emitToRun(input.runId, "step:status", {
-              runId: input.runId,
-              nodeId: node.id,
-              status: "failed",
-              errorMessage: error instanceof Error ? error.message : "Input module failed"
-            });
-            throw error;
-          }
-          await this.updateStep(input.runId, input.userId, stepIndex, {
-            status: "success",
-            startedAt: new Date(),
-            finishedAt: new Date(),
-            outputs: fileInputOutputs
-          });
-          nodeOutputs.set(node.id, fileInputOutputs);
-          socketService.emitToRun(input.runId, "step:status", {
-            runId: input.runId,
-            nodeId: node.id,
-            status: "success"
-          });
-          continue;
-        }
-        let resolvedInputs: Record<string, string>;
-        try {
-          resolvedInputs = this.resolveNodeInputs(node, input.edges, nodeOutputs, initialInputs);
-        } catch (error) {
-          await this.updateStep(input.runId, input.userId, stepIndex, {
-            status: "failed",
-            startedAt: new Date(),
-            finishedAt: new Date(),
-            errorMessage: error instanceof Error ? error.message : "Input resolution failed"
-          });
-          socketService.emitToRun(input.runId, "step:status", {
-            runId: input.runId,
-            nodeId: node.id,
-            status: "failed",
-            errorMessage: error instanceof Error ? error.message : "Input resolution failed"
-          });
-          throw error;
-        }
-        const resolvedOutputs = this.buildNodeOutputs(node, input.dirs.outputDir);
-        await this.runNode({
-          runId: input.runId,
-          userId: input.userId,
-          node,
-          stepIndex,
-          dirs: input.dirs,
-          resolvedInputs,
-          resolvedOutputs,
-          params: { ...(node.defaultParams || {}), ...input.params }
-        });
-
-        nodeOutputs.set(node.id, resolvedOutputs.relativeByName);
-        const outputFiles = this.outputFilesForNode(node, resolvedOutputs.relativeByName);
-        nodeOutputFiles.set(node.id, outputFiles);
-        runOutputFiles.push(...outputFiles);
-
-        await RunModel.updateOne(
-          { _id: input.runId, userId: input.userId },
-          { $set: { outputFiles: runOutputFiles } }
-        );
-        for (const file of outputFiles) {
-          socketService.emitToRun(input.runId, "step:output", { runId: input.runId, nodeId: node.id, file });
-        }
-      }
+      const results = await Promise.all(
+        input.items.map((item) =>
+          this.executeRunItem({
+            ...input,
+            item,
+            semaphores
+          })
+        )
+      );
+      const outputFiles = results.flatMap((result) => result.outputFiles);
+      const failedItems = results.filter((result) => result.status === "failed");
+      const cancelledItems = results.filter((result) => result.status === "cancelled");
+      const status = cancelledItems.length > 0 ? "cancelled" : failedItems.length > 0 ? "failed" : "success";
+      const errorMessage = failedItems.length > 0 ? `${failedItems.length} batch item(s) failed` : undefined;
 
       await RunModel.updateOne(
         { _id: input.runId, userId: input.userId },
-        { $set: { status: "success", finishedAt: new Date(), outputFiles: runOutputFiles } }
+        { $set: { status, finishedAt: new Date(), outputFiles, ...(errorMessage ? { errorMessage } : {}) } }
       );
       await this.writeManifest(input.runId, input.dirs.runDir);
-      socketService.emitToRun(input.runId, "run:finished", { runId: input.runId, status: "success" });
+      if (status !== "success") {
+        socketService.emitToRun(input.runId, "run:error", {
+          runId: input.runId,
+          status,
+          message: errorMessage
+        });
+      }
+      socketService.emitToRun(input.runId, "run:finished", { runId: input.runId, status });
     } catch (error) {
       const status = error instanceof CancelledRunError ? "cancelled" : "failed";
       await RunModel.updateOne(
@@ -288,13 +375,125 @@ class WorkflowRunnerService {
     }
   }
 
+  private async executeRunItem(input: {
+    runId: string;
+    userId: string;
+    nodes: WorkflowNode[];
+    edges: WorkflowEdge[];
+    executionOrder: WorkflowNode[];
+    item: PreparedRunItem;
+    dirs: RunDirs;
+    semaphores: Map<string, Semaphore>;
+    params: Record<string, string | number | boolean>;
+  }): Promise<{ status: "success" | "failed" | "cancelled"; outputFiles: StoredFile[] }> {
+    const nodeOutputs = new Map<string, NodeOutputValues>();
+    const initialFiles = new Map(input.item.inputFiles.map((file) => [file.name, file.relativePath]));
+    const initialTexts = new Map(input.item.inputValues.map((value) => [value.name, value.value]));
+    const runOutputFiles: StoredFile[] = [];
+
+    await this.updateItem(input.runId, input.userId, input.item.index, {
+      status: "running",
+      startedAt: new Date()
+    });
+
+    try {
+      for (const node of input.executionOrder) {
+        await this.throwIfCancelled(input.runId);
+        const stepIndex = input.executionOrder.findIndex((candidate) => candidate.id === node.id);
+
+        if (node.type === "fileInput") {
+          const fileInputOutputs = this.resolveInputNode(node, initialFiles, initialTexts);
+          await this.updateItemStep(input.runId, input.userId, input.item.index, stepIndex, {
+            status: "success",
+            startedAt: new Date(),
+            finishedAt: new Date(),
+            outputs: fileInputOutputs.stepByName
+          });
+          await this.syncAggregateStep(input.runId, input.userId, stepIndex);
+          nodeOutputs.set(node.id, fileInputOutputs);
+          socketService.emitToRun(input.runId, "step:status", {
+            runId: input.runId,
+            itemId: input.item.itemId,
+            nodeId: node.id,
+            status: "success"
+          });
+          continue;
+        }
+
+        const resolvedInputs = this.resolveNodeInputs(node, input.edges, nodeOutputs, initialFiles, initialTexts);
+        const resolvedOutputs = this.buildNodeOutputs(node, input.item.dirs.outputDir);
+        const semaphore = input.semaphores.get(node.id);
+        await semaphore?.acquire();
+        try {
+          await this.runNode({
+            runId: input.runId,
+            userId: input.userId,
+            itemId: input.item.itemId,
+            itemIndex: input.item.index,
+            node,
+            stepIndex,
+            dirs: input.item.dirs,
+            resolvedInputs,
+            resolvedOutputs,
+            params: { ...(node.defaultParams || {}), ...input.params }
+          });
+        } finally {
+          semaphore?.release();
+        }
+
+        nodeOutputs.set(node.id, {
+          stepByName: resolvedOutputs.relativeByName,
+          templateByName: resolvedOutputs.absoluteByName
+        });
+        const outputFiles = this.outputFilesForNode(node, resolvedOutputs.relativeByName, input.item.itemId);
+        runOutputFiles.push(...outputFiles);
+
+        await RunModel.updateOne(
+          { _id: input.runId, userId: input.userId, [`items.${input.item.index}`]: { $exists: true } },
+          {
+            $set: { [`items.${input.item.index}.outputFiles`]: runOutputFiles },
+            $push: { outputFiles: { $each: outputFiles } }
+          }
+        );
+        for (const file of outputFiles) {
+          socketService.emitToRun(input.runId, "step:output", { runId: input.runId, itemId: input.item.itemId, nodeId: node.id, file });
+        }
+      }
+
+      await this.updateItem(input.runId, input.userId, input.item.index, {
+        status: "success",
+        finishedAt: new Date(),
+        outputFiles: runOutputFiles
+      });
+      return { status: "success", outputFiles: runOutputFiles };
+    } catch (error) {
+      const status = error instanceof CancelledRunError ? "cancelled" : "failed";
+      const message = error instanceof Error ? error.message : "Batch item failed";
+      await this.updateItem(input.runId, input.userId, input.item.index, {
+        status,
+        finishedAt: new Date(),
+        errorMessage: message,
+        outputFiles: runOutputFiles
+      });
+      socketService.emitToRun(input.runId, "run:status", {
+        runId: input.runId,
+        itemId: input.item.itemId,
+        status,
+        errorMessage: message
+      });
+      return { status, outputFiles: runOutputFiles };
+    }
+  }
+
   private async runNode(input: {
     runId: string;
     userId: string;
+    itemId: string;
+    itemIndex: number;
     node: WorkflowNode;
     stepIndex: number;
     dirs: RunDirs;
-    resolvedInputs: Record<string, string>;
+    resolvedInputs: ResolvedValues;
     resolvedOutputs: {
       absoluteByName: Record<string, string>;
       relativeByName: Record<string, string>;
@@ -305,7 +504,7 @@ class WorkflowRunnerService {
     const logPath = path.join(input.dirs.logsDir, logFileName);
     const relativeLogPath = fileStorageService.relativeFromAbsolute(logPath);
     const templateScope = {
-      inputs: this.absoluteMap(input.resolvedInputs),
+      inputs: input.resolvedInputs.templateByName,
       outputs: input.resolvedOutputs.absoluteByName,
       params: input.params,
       runDir: input.dirs.runDir,
@@ -314,15 +513,17 @@ class WorkflowRunnerService {
       tempDir: input.dirs.tempDir
     };
 
-    await this.updateStep(input.runId, input.userId, input.stepIndex, {
+    await this.updateItemStep(input.runId, input.userId, input.itemIndex, input.stepIndex, {
       status: "running",
       startedAt: new Date(),
-      inputs: input.resolvedInputs,
+      inputs: input.resolvedInputs.stepByName,
       outputs: input.resolvedOutputs.relativeByName,
       logPath: relativeLogPath
     });
+    await this.syncAggregateStep(input.runId, input.userId, input.stepIndex);
     socketService.emitToRun(input.runId, "step:status", {
       runId: input.runId,
+      itemId: input.itemId,
       nodeId: input.node.id,
       status: "running"
     });
@@ -343,12 +544,14 @@ class WorkflowRunnerService {
         : process.cwd();
       const cwd = path.isAbsolute(cwdTemplate) ? cwdTemplate : path.resolve(process.cwd(), cwdTemplate);
 
-      await this.updateStep(input.runId, input.userId, input.stepIndex, {
+      await this.updateItemStep(input.runId, input.userId, input.itemIndex, input.stepIndex, {
         command: bin,
         args
       });
+      await this.syncAggregateStep(input.runId, input.userId, input.stepIndex);
       socketService.emitToRun(input.runId, "step:status", {
         runId: input.runId,
+        itemId: input.itemId,
         nodeId: input.node.id,
         status: "running",
         command: bin,
@@ -357,6 +560,7 @@ class WorkflowRunnerService {
 
       await this.spawnAndStream({
         runId: input.runId,
+        itemId: input.itemId,
         nodeId: input.node.id,
         bin,
         args,
@@ -376,13 +580,15 @@ class WorkflowRunnerService {
         })
       );
 
-      await this.updateStep(input.runId, input.userId, input.stepIndex, {
+      await this.updateItemStep(input.runId, input.userId, input.itemIndex, input.stepIndex, {
         status: "success",
         finishedAt: new Date(),
         exitCode: 0
       });
+      await this.syncAggregateStep(input.runId, input.userId, input.stepIndex);
       socketService.emitToRun(input.runId, "step:status", {
         runId: input.runId,
+        itemId: input.itemId,
         nodeId: input.node.id,
         status: "success"
       });
@@ -393,19 +599,22 @@ class WorkflowRunnerService {
       await fs.appendFile(logPath, message).catch(() => undefined);
       socketService.emitToRun(input.runId, "step:log", {
         runId: input.runId,
+        itemId: input.itemId,
         nodeId: input.node.id,
         stream: "stderr",
         message,
         timestamp: new Date().toISOString()
       });
-      await this.updateStep(input.runId, input.userId, input.stepIndex, {
+      await this.updateItemStep(input.runId, input.userId, input.itemIndex, input.stepIndex, {
         status,
         finishedAt: new Date(),
         exitCode,
         errorMessage: error instanceof Error ? error.message : "Step failed"
       });
+      await this.syncAggregateStep(input.runId, input.userId, input.stepIndex);
       socketService.emitToRun(input.runId, "step:status", {
         runId: input.runId,
+        itemId: input.itemId,
         nodeId: input.node.id,
         status,
         errorMessage: error instanceof Error ? error.message : "Step failed"
@@ -416,6 +625,7 @@ class WorkflowRunnerService {
 
   private spawnAndStream(input: {
     runId: string;
+    itemId: string;
     nodeId: string;
     bin: string;
     args: string[];
@@ -433,6 +643,7 @@ class WorkflowRunnerService {
         logStream.write(message);
         socketService.emitToRun(input.runId, "step:log", {
           runId: input.runId,
+          itemId: input.itemId,
           nodeId: input.nodeId,
           stream,
           message,
@@ -461,7 +672,9 @@ class WorkflowRunnerService {
         return;
       }
 
-      this.activeChildren.set(input.runId, child);
+      const activeChildren = this.activeChildren.get(input.runId) || new Set<ChildProcessWithoutNullStreams>();
+      activeChildren.add(child);
+      this.activeChildren.set(input.runId, activeChildren);
 
       const onChunk = (stream: "stdout" | "stderr", chunk: Buffer) => {
         emitRunnerLog(stream, chunk.toString());
@@ -476,7 +689,7 @@ class WorkflowRunnerService {
         if (timeout) clearTimeout(timeout);
         emitRunnerLog("stderr", `[runner] spawn error: ${error.message}\n`);
         logStream.end();
-        this.activeChildren.delete(input.runId);
+        this.activeChildren.get(input.runId)?.delete(child);
         reject(error);
       });
 
@@ -484,7 +697,7 @@ class WorkflowRunnerService {
         if (settled) return;
         settled = true;
         if (timeout) clearTimeout(timeout);
-        this.activeChildren.delete(input.runId);
+        this.activeChildren.get(input.runId)?.delete(child);
 
         if (this.cancelledRuns.has(input.runId)) {
           emitRunnerLog("stderr", "[runner] command cancelled\n");
@@ -511,7 +724,7 @@ class WorkflowRunnerService {
           child.kill("SIGTERM");
           emitRunnerLog("stderr", `[runner] command timed out after ${input.timeoutSeconds} seconds\n`);
           logStream.end();
-          this.activeChildren.delete(input.runId);
+          this.activeChildren.get(input.runId)?.delete(child);
           reject(new Error(`Command timed out after ${input.timeoutSeconds} seconds`));
         }, input.timeoutSeconds * 1000);
       }
@@ -521,27 +734,37 @@ class WorkflowRunnerService {
   private resolveNodeInputs(
     node: WorkflowNode,
     edges: WorkflowEdge[],
-    nodeOutputs: Map<string, Record<string, string>>,
-    initialInputs: Map<string, string>
+    nodeOutputs: Map<string, NodeOutputValues>,
+    initialFiles: Map<string, string>,
+    initialTexts: Map<string, string>
   ) {
-    const inputs: Record<string, string> = {};
+    const inputs: ResolvedValues = { stepByName: {}, templateByName: {} };
 
     for (const inputDefinition of node.inputs || []) {
       const incoming = edges.find(
         (edge) => edge.target === node.id && (!edge.targetHandle || edge.targetHandle === inputDefinition.name)
       );
       if (incoming) {
-        const upstreamOutputs = nodeOutputs.get(incoming.source) || {};
-        const outputName = incoming.sourceHandle || Object.keys(upstreamOutputs)[0];
-        if (outputName && upstreamOutputs[outputName]) {
-          inputs[inputDefinition.name] = upstreamOutputs[outputName];
+        const upstreamOutputs = nodeOutputs.get(incoming.source);
+        const outputName = incoming.sourceHandle || Object.keys(upstreamOutputs?.stepByName || {})[0];
+        if (upstreamOutputs && outputName && upstreamOutputs.stepByName[outputName] !== undefined) {
+          inputs.stepByName[inputDefinition.name] = upstreamOutputs.stepByName[outputName];
+          inputs.templateByName[inputDefinition.name] = upstreamOutputs.templateByName[outputName];
           continue;
         }
       }
 
-      const initialInput = initialInputs.get(inputDefinition.name);
-      if (initialInput) {
-        inputs[inputDefinition.name] = initialInput;
+      const initialFile = initialFiles.get(inputDefinition.name);
+      if (initialFile) {
+        inputs.stepByName[inputDefinition.name] = initialFile;
+        inputs.templateByName[inputDefinition.name] = fileStorageService.resolveRelativePath(initialFile);
+        continue;
+      }
+
+      const initialText = initialTexts.get(inputDefinition.name);
+      if (initialText !== undefined) {
+        inputs.stepByName[inputDefinition.name] = initialText;
+        inputs.templateByName[inputDefinition.name] = initialText;
         continue;
       }
 
@@ -553,14 +776,25 @@ class WorkflowRunnerService {
     return inputs;
   }
 
-  private resolveFileInputNode(node: WorkflowNode, initialInputs: Map<string, string>) {
-    const outputs: Record<string, string> = {};
+  private resolveInputNode(node: WorkflowNode, initialFiles: Map<string, string>, initialTexts: Map<string, string>): NodeOutputValues {
+    const outputs: NodeOutputValues = { stepByName: {}, templateByName: {} };
     for (const output of node.outputs || []) {
-      const selectedFile = initialInputs.get(output.name);
-      if (!selectedFile) {
-        throw new Error(`Missing selected file for input module "${output.name}"`);
+      if (output.type === "text") {
+        const textValue = initialTexts.get(output.name);
+        if (textValue === undefined) {
+          throw new Error(`Missing text value for input "${output.name}"`);
+        }
+        outputs.stepByName[output.name] = textValue;
+        outputs.templateByName[output.name] = textValue;
+        continue;
       }
-      outputs[output.name] = selectedFile;
+
+      const selectedFile = initialFiles.get(output.name);
+      if (!selectedFile) {
+        throw new Error(`Missing selected file for input "${output.name}"`);
+      }
+      outputs.stepByName[output.name] = selectedFile;
+      outputs.templateByName[output.name] = fileStorageService.resolveRelativePath(selectedFile);
     }
     return outputs;
   }
@@ -570,6 +804,9 @@ class WorkflowRunnerService {
     const relativeByName: Record<string, string> = {};
 
     for (const output of node.outputs || []) {
+      if (output.type !== "file") {
+        continue;
+      }
       const extension = output.extension?.replace(/^\./, "") || "out";
       const fileName = `${sanitizeFileName(node.id)}_${sanitizeFileName(output.name)}.${extension}`;
       const absolutePath = path.join(outputDir, fileName);
@@ -580,21 +817,16 @@ class WorkflowRunnerService {
     return { absoluteByName, relativeByName };
   }
 
-  private outputFilesForNode(node: WorkflowNode, outputs: Record<string, string>): StoredFile[] {
+  private outputFilesForNode(node: WorkflowNode, outputs: Record<string, string>, itemId?: string): StoredFile[] {
     return Object.entries(outputs).map(([name, relativePath]) => {
       const definition = node.outputs.find((output) => output.name === name) as WorkflowOutputDefinition | undefined;
       return {
         name,
         relativePath,
-        preview: definition?.preview || previewTypeForPath(relativePath)
+        preview: definition?.preview || previewTypeForPath(relativePath),
+        itemId
       };
     });
-  }
-
-  private absoluteMap(relativeByName: Record<string, string>) {
-    return Object.fromEntries(
-      Object.entries(relativeByName).map(([name, relativePath]) => [name, fileStorageService.resolveRelativePath(relativePath)])
-    );
   }
 
   private resolveTemplate(value: string, scope: Record<string, unknown>, context: string) {
@@ -686,6 +918,79 @@ class WorkflowRunnerService {
     if (result.matchedCount === 0) {
       throw new HttpError(404, "Run not found");
     }
+  }
+
+  private async updateItem(
+    runId: string,
+    userId: string,
+    itemIndex: number,
+    partial: Partial<Omit<RunItem, "steps" | "itemId" | "index" | "label">>
+  ) {
+    const updates: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(partial)) {
+      if (value !== undefined) {
+        updates[`items.${itemIndex}.${key}`] = value;
+      }
+    }
+    if (Object.keys(updates).length === 0) {
+      return;
+    }
+    await RunModel.updateOne(
+      { _id: runId, userId, [`items.${itemIndex}`]: { $exists: true } },
+      { $set: updates }
+    );
+  }
+
+  private async updateItemStep(runId: string, userId: string, itemIndex: number, stepIndex: number, partial: Partial<RunStep>) {
+    const updates: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(partial)) {
+      if (value !== undefined) {
+        updates[`items.${itemIndex}.steps.${stepIndex}.${key}`] = value;
+      }
+    }
+    if (Object.keys(updates).length === 0) {
+      return;
+    }
+    await RunModel.updateOne(
+      { _id: runId, userId, [`items.${itemIndex}.steps.${stepIndex}`]: { $exists: true } },
+      { $set: updates }
+    );
+  }
+
+  private async syncAggregateStep(runId: string, userId: string, stepIndex: number) {
+    const run = await RunModel.findOne({ _id: runId, userId }).select("items steps").lean();
+    if (!run?.items?.length) {
+      return;
+    }
+
+    const itemSteps = run.items.map((item) => item.steps?.[stepIndex]).filter(Boolean);
+    if (itemSteps.length === 0) {
+      return;
+    }
+
+    const status = itemSteps.some((step) => step.status === "failed")
+      ? "failed"
+      : itemSteps.some((step) => step.status === "cancelled")
+        ? "cancelled"
+        : itemSteps.some((step) => step.status === "running")
+          ? "running"
+          : itemSteps.every((step) => step.status === "success")
+            ? "success"
+            : "waiting";
+    const sample = itemSteps.find((step) => step.status === "running") || itemSteps.find((step) => step.status === "failed") || itemSteps[0];
+
+    await this.updateStep(runId, userId, stepIndex, {
+      status,
+      startedAt: sample.startedAt || undefined,
+      finishedAt: status === "success" || status === "failed" || status === "cancelled" ? sample.finishedAt || undefined : undefined,
+      exitCode: sample.exitCode ?? undefined,
+      command: sample.command || undefined,
+      args: sample.args,
+      inputs: sample.inputs,
+      outputs: sample.outputs,
+      logPath: sample.logPath || undefined,
+      errorMessage: sample.errorMessage || undefined
+    });
   }
 
   private async throwIfCancelled(runId: string) {

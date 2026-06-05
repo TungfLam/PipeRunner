@@ -66,7 +66,7 @@ function newFileInputNode(index: number): WorkflowNodeConfig {
   return {
     id,
     type: "fileInput",
-    label: "Input File",
+    label: "Input",
     position: { x: 40 + index * 25, y: 80 + index * 25 },
     toolConfig: {
       bin: "__file_input__",
@@ -377,7 +377,7 @@ export function WorkflowEditorPage() {
             Tool
           </Button>
           <Button startIcon={<AddIcon />} variant="outlined" onClick={addFileInput}>
-            File Input
+            Input
           </Button>
           <Button
             startIcon={<LinkOffIcon />}

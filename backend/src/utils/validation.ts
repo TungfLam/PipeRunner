@@ -12,7 +12,7 @@ export const nodeInputSchema = z.object({
 
 export const nodeOutputSchema = z.object({
   name: z.string().min(1),
-  type: z.literal("file").default("file"),
+  type: z.enum(["file", "text"]).default("file"),
   flag: z.string().optional(),
   extension: z.string().optional(),
   preview: z.enum(["video", "audio", "text", "json", "image"]).optional()
@@ -31,7 +31,8 @@ export const workflowNodeSchema = z.object({
     args: z.array(z.string()).default([]),
     workingDir: z.string().optional(),
     env: envRecordSchema.optional(),
-    timeoutSeconds: z.number().positive().optional()
+    timeoutSeconds: z.number().positive().optional(),
+    maxConcurrent: z.number().int().positive().max(100).optional()
   }),
   inputs: z.array(nodeInputSchema).default([]),
   outputs: z.array(nodeOutputSchema).default([]),

@@ -7,7 +7,8 @@ const fileSchema = new Schema(
     mimeType: { type: String },
     size: { type: Number },
     relativePath: { type: String, required: true },
-    preview: { type: String, enum: ["video", "audio", "text", "json", "image"] }
+    preview: { type: String, enum: ["video", "audio", "text", "json", "image"] },
+    itemId: { type: String }
   },
   { _id: false }
 );
@@ -34,6 +35,37 @@ const runStepSchema = new Schema(
   { _id: false }
 );
 
+const inputValueSchema = new Schema(
+  {
+    name: { type: String, required: true },
+    type: { type: String, enum: ["text"], default: "text" },
+    value: { type: String, required: true }
+  },
+  { _id: false }
+);
+
+const runItemSchema = new Schema(
+  {
+    itemId: { type: String, required: true },
+    index: { type: Number, required: true },
+    label: { type: String, required: true },
+    status: {
+      type: String,
+      enum: ["pending", "running", "success", "failed", "cancelled"],
+      default: "pending"
+    },
+    startedAt: { type: Date },
+    finishedAt: { type: Date },
+    workingDir: { type: String },
+    inputFiles: [fileSchema],
+    inputValues: [inputValueSchema],
+    outputFiles: [fileSchema],
+    steps: [runStepSchema],
+    errorMessage: { type: String }
+  },
+  { _id: false }
+);
+
 const runSchema = new Schema(
   {
     userId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
@@ -51,6 +83,7 @@ const runSchema = new Schema(
     inputFiles: [fileSchema],
     outputFiles: [fileSchema],
     steps: [runStepSchema],
+    items: [runItemSchema],
     params: { type: Schema.Types.Mixed, default: {} },
     errorMessage: { type: String }
   },

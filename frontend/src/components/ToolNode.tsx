@@ -165,7 +165,7 @@ export function ToolNode({ data, selected }: NodeProps) {
           {status === "failed" && <ErrorOutlineIcon color="error" fontSize="small" />}
         </Stack>
         <Typography variant="caption" color="text.secondary" noWrap title={node.toolConfig.bin}>
-          {node.type === "fileInput" ? "file picker" : node.toolConfig.bin || "command"}
+          {node.type === "fileInput" ? "input" : node.toolConfig.bin || "command"}
         </Typography>
       </Stack>
     </Box>

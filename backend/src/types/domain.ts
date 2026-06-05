@@ -12,6 +12,7 @@ export interface ToolCommandConfig {
   workingDir?: string;
   env?: Record<string, string>;
   timeoutSeconds?: number;
+  maxConcurrent?: number;
 }
 
 export interface WorkflowInputDefinition {
@@ -24,7 +25,7 @@ export interface WorkflowInputDefinition {
 
 export interface WorkflowOutputDefinition {
   name: string;
-  type: "file";
+  type: "file" | "text";
   flag?: string;
   extension?: string;
   preview?: PreviewType;
@@ -59,6 +60,13 @@ export interface StoredFile {
   size?: number;
   relativePath: string;
   preview?: PreviewType;
+  itemId?: string;
+}
+
+export interface RunInputValue {
+  name: string;
+  type: "text";
+  value: string;
 }
 
 export interface RunStep {
@@ -73,5 +81,20 @@ export interface RunStep {
   inputs?: Record<string, string>;
   outputs?: Record<string, string>;
   logPath?: string;
+  errorMessage?: string;
+}
+
+export interface RunItem {
+  itemId: string;
+  index: number;
+  label: string;
+  status: RunStatus;
+  startedAt?: Date;
+  finishedAt?: Date;
+  workingDir?: string;
+  inputFiles?: StoredFile[];
+  inputValues?: RunInputValue[];
+  outputFiles?: StoredFile[];
+  steps: RunStep[];
   errorMessage?: string;
 }
