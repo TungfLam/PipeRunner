@@ -1,4 +1,5 @@
 import DeleteIcon from "@mui/icons-material/Delete";
+import AddIcon from "@mui/icons-material/Add";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
@@ -24,7 +25,7 @@ interface Props {
 export function RunDialog({ workflow, open, onClose }: Props) {
   const navigate = useNavigate();
   const [files, setFiles] = useState<Record<string, File[]>>({});
-  const [textInputs, setTextInputs] = useState<Record<string, string>>({});
+  const [textInputs, setTextInputs] = useState<Record<string, string[]>>({});
   const [paramsJson, setParamsJson] = useState("{}");
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
@@ -39,6 +40,25 @@ export function RunDialog({ workflow, open, onClose }: Props) {
       ...current,
       [inputName]: (current[inputName] || []).filter((_file, fileIndex) => fileIndex !== index)
     }));
+  };
+
+  const setTextItem = (inputName: string, index: number, value: string) => {
+    setTextInputs((current) => {
+      const items = current[inputName]?.length ? [...current[inputName]] : [""];
+      items[index] = value;
+      return { ...current, [inputName]: items };
+    });
+  };
+
+  const addTextItem = (inputName: string) => {
+    setTextInputs((current) => ({ ...current, [inputName]: [...(current[inputName] || [""]), ""] }));
+  };
+
+  const removeTextItem = (inputName: string, index: number) => {
+    setTextInputs((current) => {
+      const nextItems = (current[inputName] || [""]).filter((_item, itemIndex) => itemIndex !== index);
+      return { ...current, [inputName]: nextItems.length ? nextItems : [""] };
+    });
   };
 
   const requiredInputs = useMemo(() => {
@@ -79,10 +99,9 @@ export function RunDialog({ workflow, open, onClose }: Props) {
         "textInputs",
         JSON.stringify(
           Object.fromEntries(
-            Object.entries(textInputs).map(([inputName, value]) => [
+            Object.entries(textInputs).map(([inputName, values]) => [
               inputName,
-              value
-                .split("\n")
+              values
                 .map((line) => line.trim())
                 .filter(Boolean)
             ])
@@ -112,19 +131,44 @@ export function RunDialog({ workflow, open, onClose }: Props) {
           ) : (
             requiredInputs.map((input) => {
               const selectedFiles = files[input.name] || [];
+              const textItems = textInputs[input.name]?.length ? textInputs[input.name] : [""];
               if (input.type === "text") {
                 return (
-                  <TextField
-                    key={input.name}
-                    label={`${input.name}${input.required ? " *" : ""}`}
-                    placeholder={"https://example.com/item-1\nhttps://example.com/item-2"}
-                    value={textInputs[input.name] || ""}
-                    onChange={(event) => setTextInputs((current) => ({ ...current, [input.name]: event.target.value }))}
-                    minRows={4}
-                    multiline
-                    fullWidth
-                    helperText="One non-empty line becomes one batch item. The value is passed as a string."
-                  />
+                  <Box key={input.name}>
+                    <Stack spacing={1}>
+                      <Stack direction="row" spacing={1} alignItems="center">
+                        <Typography variant="subtitle2" sx={{ flexGrow: 1 }}>
+                          {input.name}
+                          {input.required ? " *" : ""}
+                        </Typography>
+                        <Button size="small" startIcon={<AddIcon />} variant="outlined" onClick={() => addTextItem(input.name)}>
+                          Item
+                        </Button>
+                      </Stack>
+                      {textItems.map((value, index) => (
+                        <Stack key={`${input.name}-text-${index}`} direction="row" spacing={1} alignItems="flex-start">
+                          <TextField
+                            label={`Item ${index + 1}`}
+                            placeholder="https://example.com/item"
+                            value={value}
+                            onChange={(event) => setTextItem(input.name, index, event.target.value)}
+                            size="small"
+                            fullWidth
+                            helperText={index === 0 ? "Each item becomes one batch item. The value is passed as a string." : " "}
+                          />
+                          <IconButton
+                            size="small"
+                            color="error"
+                            onClick={() => removeTextItem(input.name, index)}
+                            disabled={textItems.length === 1 && !value}
+                            sx={{ mt: 0.5 }}
+                          >
+                            <DeleteIcon fontSize="small" />
+                          </IconButton>
+                        </Stack>
+                      ))}
+                    </Stack>
+                  </Box>
                 );
               }
               return (
