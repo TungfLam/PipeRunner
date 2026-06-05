@@ -116,6 +116,10 @@ export function RunPage() {
     runQuery.data?.items?.[0] ||
     null;
   const activeSteps = selectedItem?.steps?.length ? selectedItem.steps : runQuery.data?.steps || [];
+  const firstRerunnableStep = useMemo(
+    () => activeSteps.find((step) => ["failed", "cancelled"].includes(step.status)),
+    [activeSteps]
+  );
 
   const stepsByNode = useMemo(() => {
     const map = new Map<string, RunStep>();
@@ -309,6 +313,7 @@ export function RunPage() {
                 <TableCell align="right">
                   <Stack direction="row" spacing={1} justifyContent="flex-end">
                     {["failed", "cancelled"].includes(step.status) &&
+                      firstRerunnableStep?.nodeId === step.nodeId &&
                       selectedItem &&
                       !["running", "pending"].includes(runQuery.data.status) && (
                       <Button

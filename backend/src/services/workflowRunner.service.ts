@@ -257,6 +257,15 @@ class WorkflowRunnerService {
     if (!runItem.workingDir) {
       throw new HttpError(400, "Batch item does not have a working directory");
     }
+    const runItemSteps = (runItem.steps?.length ? runItem.steps : run.steps || []).map((step) => this.normalizeRunStep(step));
+    const stepsByNodeId = new Map(runItemSteps.map((step) => [step.nodeId, step]));
+    const firstBlockedIndex = executionOrder.findIndex((node) => {
+      const status = stepsByNodeId.get(node.id)?.status;
+      return status === "failed" || status === "cancelled";
+    });
+    if (firstBlockedIndex !== -1 && startIndex > firstBlockedIndex) {
+      throw new HttpError(400, "Rerun from the first failed or cancelled step first");
+    }
 
     const itemRoot = fileStorageService.resolveRelativePath(runItem.workingDir);
     const item: PreparedRunItem = {
@@ -281,7 +290,7 @@ class WorkflowRunnerService {
 
     const existingItemOutputs = (runItem.outputFiles || []).map((file) => this.normalizeStoredFile(file));
     const existingRunOutputs = (run.outputFiles || []).map((file) => this.normalizeStoredFile(file));
-    const nextSteps = this.stepsForRerun(executionOrder, (runItem.steps || []).map((step) => this.normalizeRunStep(step)), startIndex);
+    const nextSteps = this.stepsForRerun(executionOrder, runItemSteps, startIndex);
     this.cancelledRuns.delete(runId);
 
     await RunModel.updateOne(
