@@ -57,6 +57,7 @@ const runItemSchema = new Schema(
     startedAt: { type: Date },
     finishedAt: { type: Date },
     workingDir: { type: String },
+    exportDir: { type: String },
     inputFiles: [fileSchema],
     inputValues: [inputValueSchema],
     outputFiles: [fileSchema],

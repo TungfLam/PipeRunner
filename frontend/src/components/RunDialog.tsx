@@ -26,6 +26,7 @@ export function RunDialog({ workflow, open, onClose }: Props) {
   const navigate = useNavigate();
   const [files, setFiles] = useState<Record<string, File[]>>({});
   const [textInputs, setTextInputs] = useState<Record<string, string[]>>({});
+  const [exportDirs, setExportDirs] = useState<Record<string, string[]>>({});
   const [paramsJson, setParamsJson] = useState("{}");
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
@@ -33,6 +34,7 @@ export function RunDialog({ workflow, open, onClose }: Props) {
   const addFile = (inputName: string, file?: File) => {
     if (!file) return;
     setFiles((current) => ({ ...current, [inputName]: [...(current[inputName] || []), file] }));
+    setExportDirs((current) => ({ ...current, [inputName]: [...(current[inputName] || []), ""] }));
   };
 
   const removeFile = (inputName: string, index: number) => {
@@ -40,6 +42,18 @@ export function RunDialog({ workflow, open, onClose }: Props) {
       ...current,
       [inputName]: (current[inputName] || []).filter((_file, fileIndex) => fileIndex !== index)
     }));
+    setExportDirs((current) => ({
+      ...current,
+      [inputName]: (current[inputName] || []).filter((_dir, dirIndex) => dirIndex !== index)
+    }));
+  };
+
+  const setExportDir = (inputName: string, index: number, value: string) => {
+    setExportDirs((current) => {
+      const items = current[inputName]?.length ? [...current[inputName]] : [""];
+      items[index] = value;
+      return { ...current, [inputName]: items };
+    });
   };
 
   const setTextItem = (inputName: string, index: number, value: string) => {
@@ -52,10 +66,15 @@ export function RunDialog({ workflow, open, onClose }: Props) {
 
   const addTextItem = (inputName: string) => {
     setTextInputs((current) => ({ ...current, [inputName]: [...(current[inputName] || [""]), ""] }));
+    setExportDirs((current) => ({ ...current, [inputName]: [...(current[inputName] || [""]), ""] }));
   };
 
   const removeTextItem = (inputName: string, index: number) => {
     setTextInputs((current) => {
+      const nextItems = (current[inputName] || [""]).filter((_item, itemIndex) => itemIndex !== index);
+      return { ...current, [inputName]: nextItems.length ? nextItems : [""] };
+    });
+    setExportDirs((current) => {
       const nextItems = (current[inputName] || [""]).filter((_item, itemIndex) => itemIndex !== index);
       return { ...current, [inputName]: nextItems.length ? nextItems : [""] };
     });
@@ -108,6 +127,21 @@ export function RunDialog({ workflow, open, onClose }: Props) {
           )
         )
       );
+      const exportDirPayload: Record<string, string[]> = {};
+      for (const [inputName, inputFiles] of Object.entries(files)) {
+        if (inputFiles.length) {
+          exportDirPayload[inputName] = inputFiles.map((_file, index) => (exportDirs[inputName]?.[index] || "").trim());
+        }
+      }
+      for (const [inputName, values] of Object.entries(textInputs)) {
+        const dirsForText = values.flatMap((value, index) =>
+          value.trim() ? [(exportDirs[inputName]?.[index] || "").trim()] : []
+        );
+        if (dirsForText.length) {
+          exportDirPayload[inputName] = dirsForText;
+        }
+      }
+      formData.append("exportDirs", JSON.stringify(exportDirPayload));
       formData.append("params", JSON.stringify(JSON.parse(paramsJson || "{}")));
       formData.append("inputs", JSON.stringify({}));
       const response = await api.post(`/workflows/${workflow._id}/runs`, formData);
@@ -132,6 +166,7 @@ export function RunDialog({ workflow, open, onClose }: Props) {
             requiredInputs.map((input) => {
               const selectedFiles = files[input.name] || [];
               const textItems = textInputs[input.name]?.length ? textInputs[input.name] : [""];
+              const itemExportDirs = exportDirs[input.name] || [];
               if (input.type === "text") {
                 return (
                   <Box key={input.name}>
@@ -146,7 +181,12 @@ export function RunDialog({ workflow, open, onClose }: Props) {
                         </Button>
                       </Stack>
                       {textItems.map((value, index) => (
-                        <Stack key={`${input.name}-text-${index}`} direction="row" spacing={1} alignItems="flex-start">
+                        <Stack
+                          key={`${input.name}-text-${index}`}
+                          direction={{ xs: "column", sm: "row" }}
+                          spacing={1}
+                          alignItems={{ xs: "stretch", sm: "flex-start" }}
+                        >
                           <TextField
                             label={`Item ${index + 1}`}
                             placeholder="https://example.com/item"
@@ -155,6 +195,15 @@ export function RunDialog({ workflow, open, onClose }: Props) {
                             size="small"
                             fullWidth
                             helperText={index === 0 ? "Each item becomes one batch item. The value is passed as a string." : " "}
+                          />
+                          <TextField
+                            label="Auto download folder"
+                            placeholder="/home/tungflam/Downloads/workflow-output"
+                            value={itemExportDirs[index] || ""}
+                            onChange={(event) => setExportDir(input.name, index, event.target.value)}
+                            size="small"
+                            fullWidth
+                            helperText={index === 0 ? "Optional absolute folder path." : " "}
                           />
                           <IconButton
                             size="small"
@@ -193,20 +242,29 @@ export function RunDialog({ workflow, open, onClose }: Props) {
                         {selectedFiles.map((file, index) => (
                           <Stack
                             key={`${file.name}-${file.lastModified}-${index}`}
-                            direction="row"
                             spacing={1}
-                            alignItems="center"
                             sx={{ border: "1px solid", borderColor: "divider", borderRadius: 1, px: 1, py: 0.75 }}
                           >
-                            <Typography variant="body2" sx={{ flexGrow: 1, minWidth: 0 }} noWrap title={file.name}>
-                              {index + 1}. {file.name}
-                            </Typography>
-                            <Typography variant="caption" color="text.secondary">
-                              {(file.size / 1024 / 1024).toFixed(file.size >= 10 * 1024 * 1024 ? 0 : 1)} MB
-                            </Typography>
-                            <IconButton size="small" color="error" onClick={() => removeFile(input.name, index)}>
-                              <DeleteIcon fontSize="small" />
-                            </IconButton>
+                            <Stack direction="row" spacing={1} alignItems="center">
+                              <Typography variant="body2" sx={{ flexGrow: 1, minWidth: 0 }} noWrap title={file.name}>
+                                {index + 1}. {file.name}
+                              </Typography>
+                              <Typography variant="caption" color="text.secondary">
+                                {(file.size / 1024 / 1024).toFixed(file.size >= 10 * 1024 * 1024 ? 0 : 1)} MB
+                              </Typography>
+                              <IconButton size="small" color="error" onClick={() => removeFile(input.name, index)}>
+                                <DeleteIcon fontSize="small" />
+                              </IconButton>
+                            </Stack>
+                            <TextField
+                              label="Auto download folder"
+                              placeholder="/home/tungflam/Downloads/workflow-output"
+                              value={itemExportDirs[index] || ""}
+                              onChange={(event) => setExportDir(input.name, index, event.target.value)}
+                              size="small"
+                              fullWidth
+                              helperText="Optional absolute folder path."
+                            />
                           </Stack>
                         ))}
                       </Stack>

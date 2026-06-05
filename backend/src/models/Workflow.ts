@@ -6,7 +6,8 @@ const workflowInputSchema = new Schema(
     type: { type: String, enum: ["file", "text", "number", "boolean"], default: "file" },
     flag: { type: String },
     accept: [{ type: String }],
-    required: { type: Boolean, default: false }
+    required: { type: Boolean, default: false },
+    autoDownload: { type: Boolean, default: false }
   },
   { _id: false }
 );
@@ -17,7 +18,8 @@ const workflowOutputSchema = new Schema(
     type: { type: String, enum: ["file", "text"], default: "file" },
     flag: { type: String },
     extension: { type: String },
-    preview: { type: String, enum: ["video", "audio", "text", "json", "image"] }
+    preview: { type: String, enum: ["video", "audio", "text", "json", "image"] },
+    autoDownload: { type: Boolean, default: false }
   },
   { _id: false }
 );

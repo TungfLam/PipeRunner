@@ -20,6 +20,7 @@ interface StartRunInput {
   workflowId: string;
   selectedInputs: Record<string, string | string[]>;
   textInputs: Record<string, string[]>;
+  exportDirs: Record<string, string[]>;
   uploadedFiles: Express.Multer.File[];
   params: Record<string, string | number | boolean>;
 }
@@ -39,6 +40,7 @@ interface PreparedRunItem {
   dirs: RunDirs;
   inputFiles: StoredFile[];
   inputValues: RunInputValue[];
+  exportDir?: string;
 }
 
 interface ResolvedValues {
@@ -130,6 +132,7 @@ class WorkflowRunnerService {
       runDir: dirs.runDir,
       selectedInputs: input.selectedInputs,
       textInputs: input.textInputs,
+      exportDirs: input.exportDirs,
       uploadedFiles: input.uploadedFiles,
       steps
     });
@@ -140,6 +143,7 @@ class WorkflowRunnerService {
       label: item.label,
       status: "pending",
       workingDir: fileStorageService.relativeFromAbsolute(item.dirs.runDir),
+      exportDir: item.exportDir,
       inputFiles: item.inputFiles,
       inputValues: item.inputValues,
       outputFiles: [],
@@ -217,34 +221,40 @@ class WorkflowRunnerService {
     runDir: string;
     selectedInputs: Record<string, string | string[]>;
     textInputs: Record<string, string[]>;
+    exportDirs: Record<string, string[]>;
     uploadedFiles: Express.Multer.File[];
     steps: RunStep[];
   }): Promise<PreparedRunItem[]> {
     type BatchValue =
-      | { kind: "upload"; inputName: string; file: Express.Multer.File }
-      | { kind: "selected"; inputName: string; relativePath: string }
-      | { kind: "text"; inputName: string; value: string };
+      | { kind: "upload"; inputName: string; file: Express.Multer.File; exportDir?: string }
+      | { kind: "selected"; inputName: string; relativePath: string; exportDir?: string }
+      | { kind: "text"; inputName: string; value: string; exportDir?: string };
 
     const valuesByInput = new Map<string, BatchValue[]>();
     const appendValue = (inputName: string, value: BatchValue) => {
       valuesByInput.set(inputName, [...(valuesByInput.get(inputName) || []), value]);
     };
 
+    const uploadIndexes = new Map<string, number>();
     for (const file of input.uploadedFiles) {
       const inputName = file.fieldname === "files" ? path.parse(file.originalname).name : file.fieldname;
-      appendValue(inputName, { kind: "upload", inputName, file });
+      const valueIndex = uploadIndexes.get(inputName) || 0;
+      uploadIndexes.set(inputName, valueIndex + 1);
+      appendValue(inputName, { kind: "upload", inputName, file, exportDir: input.exportDirs[inputName]?.[valueIndex] });
     }
 
     for (const [inputName, selectedValue] of Object.entries(input.selectedInputs || {})) {
       const selectedPaths = (Array.isArray(selectedValue) ? selectedValue : [selectedValue]).filter(Boolean);
-      for (const relativePath of selectedPaths) {
-        appendValue(inputName, { kind: "selected", inputName, relativePath });
+      for (const [valueIndex, relativePath] of selectedPaths.entries()) {
+        appendValue(inputName, { kind: "selected", inputName, relativePath, exportDir: input.exportDirs[inputName]?.[valueIndex] });
       }
     }
 
     for (const [inputName, textValues] of Object.entries(input.textInputs || {})) {
-      for (const value of (Array.isArray(textValues) ? textValues : [textValues]).map((item) => String(item).trim()).filter(Boolean)) {
-        appendValue(inputName, { kind: "text", inputName, value });
+      const normalizedValues = (Array.isArray(textValues) ? textValues : [textValues]).map((item) => String(item).trim());
+      for (const [valueIndex, value] of normalizedValues.entries()) {
+        if (!value) continue;
+        appendValue(inputName, { kind: "text", inputName, value, exportDir: input.exportDirs[inputName]?.[valueIndex] });
       }
     }
 
@@ -271,10 +281,14 @@ class WorkflowRunnerService {
       const inputFiles: StoredFile[] = [];
       const inputValues: RunInputValue[] = [];
       const labels: string[] = [];
+      const exportDirs: string[] = [];
 
       for (const values of valuesByInput.values()) {
         const value = values[values.length === 1 ? 0 : index];
         if (!value) continue;
+        if (value.exportDir?.trim()) {
+          exportDirs.push(value.exportDir.trim());
+        }
 
         if (value.kind === "upload") {
           const storedFile = await fileStorageService.saveRunUpload(dirs.inputDir, value.inputName, value.file);
@@ -300,7 +314,8 @@ class WorkflowRunnerService {
         label: labels.filter(Boolean).join(", ") || `Item ${index + 1}`,
         dirs,
         inputFiles,
-        inputValues
+        inputValues,
+        exportDir: exportDirs[0]
       });
     }
 
@@ -403,6 +418,18 @@ class WorkflowRunnerService {
 
         if (node.type === "fileInput") {
           const fileInputOutputs = this.resolveInputNode(node, initialFiles, initialTexts);
+          await this.copyAutoDownloadFiles({
+            runId: input.runId,
+            userId: input.userId,
+            itemId: input.item.itemId,
+            node,
+            exportDir: input.item.exportDir,
+            resolvedInputs: { stepByName: {}, templateByName: {} },
+            resolvedOutputs: {
+              relativeByName: fileInputOutputs.stepByName,
+              absoluteByName: fileInputOutputs.templateByName
+            }
+          });
           await this.updateItemStep(input.runId, input.userId, input.item.index, stepIndex, {
             status: "success",
             startedAt: new Date(),
@@ -433,6 +460,7 @@ class WorkflowRunnerService {
             node,
             stepIndex,
             dirs: input.item.dirs,
+            exportDir: input.item.exportDir,
             resolvedInputs,
             resolvedOutputs,
             params: { ...(node.defaultParams || {}), ...input.params }
@@ -493,6 +521,7 @@ class WorkflowRunnerService {
     node: WorkflowNode;
     stepIndex: number;
     dirs: RunDirs;
+    exportDir?: string;
     resolvedInputs: ResolvedValues;
     resolvedOutputs: {
       absoluteByName: Record<string, string>;
@@ -579,6 +608,17 @@ class WorkflowRunnerService {
           }
         })
       );
+
+      await this.copyAutoDownloadFiles({
+        runId: input.runId,
+        userId: input.userId,
+        itemId: input.itemId,
+        node: input.node,
+        exportDir: input.exportDir,
+        resolvedInputs: input.resolvedInputs,
+        resolvedOutputs: input.resolvedOutputs,
+        logPath
+      });
 
       await this.updateItemStep(input.runId, input.userId, input.itemIndex, input.stepIndex, {
         status: "success",
@@ -826,6 +866,112 @@ class WorkflowRunnerService {
         preview: definition?.preview || previewTypeForPath(relativePath),
         itemId
       };
+    });
+  }
+
+  private async copyAutoDownloadFiles(input: {
+    runId: string;
+    userId: string;
+    itemId: string;
+    node: WorkflowNode;
+    exportDir?: string;
+    resolvedInputs: ResolvedValues;
+    resolvedOutputs: {
+      absoluteByName: Record<string, string>;
+      relativeByName: Record<string, string>;
+    };
+    logPath?: string;
+  }) {
+    const exportDir = input.exportDir?.trim();
+    if (!exportDir) {
+      return;
+    }
+
+    const candidates: Array<{ label: string; relativePath: string }> = [];
+    for (const definition of input.node.inputs || []) {
+      if (definition.autoDownload && definition.type === "file") {
+        const relativePath = input.resolvedInputs.stepByName[definition.name];
+        if (relativePath) {
+          candidates.push({ label: `input:${definition.name}`, relativePath });
+        }
+      }
+    }
+    for (const definition of input.node.outputs || []) {
+      if (definition.autoDownload && definition.type === "file") {
+        const relativePath = input.resolvedOutputs.relativeByName[definition.name];
+        if (relativePath) {
+          candidates.push({ label: `output:${definition.name}`, relativePath });
+        }
+      }
+    }
+
+    if (candidates.length === 0) {
+      return;
+    }
+
+    if (!path.isAbsolute(exportDir)) {
+      throw new Error(`Auto download folder must be an absolute path: ${exportDir}`);
+    }
+
+    const targetDir = path.resolve(exportDir);
+    await fs.mkdir(targetDir, { recursive: true });
+
+    for (const candidate of candidates) {
+      if (path.isAbsolute(candidate.relativePath)) {
+        throw new Error(`Auto download source must be a stored relative path: ${candidate.relativePath}`);
+      }
+      fileStorageService.assertUserOwnsPath(input.userId, candidate.relativePath);
+      const sourcePath = fileStorageService.resolveRelativePath(candidate.relativePath);
+      const sourceStat = await fs.stat(sourcePath);
+      if (!sourceStat.isFile()) {
+        continue;
+      }
+      const destinationPath = await this.nextAvailableExportPath(targetDir, path.basename(sourcePath));
+      await fs.copyFile(sourcePath, destinationPath);
+      await this.emitStepLog({
+        runId: input.runId,
+        itemId: input.itemId,
+        nodeId: input.node.id,
+        logPath: input.logPath,
+        stream: "stdout",
+        message: `[runner] auto-downloaded ${candidate.label}: ${destinationPath}\n`
+      });
+    }
+  }
+
+  private async nextAvailableExportPath(targetDir: string, fileName: string) {
+    const safeName = sanitizeFileName(fileName);
+    const parsed = path.parse(safeName);
+    for (let index = 0; index < 10_000; index += 1) {
+      const candidateName = index === 0 ? safeName : `${parsed.name}_${index + 1}${parsed.ext}`;
+      const candidatePath = path.join(targetDir, candidateName);
+      try {
+        await fs.access(candidatePath, fsSync.constants.F_OK);
+      } catch {
+        return candidatePath;
+      }
+    }
+    throw new Error(`Unable to find available export file name for ${safeName}`);
+  }
+
+  private async emitStepLog(input: {
+    runId: string;
+    itemId: string;
+    nodeId: string;
+    logPath?: string;
+    stream: "stdout" | "stderr";
+    message: string;
+  }) {
+    if (input.logPath) {
+      await fs.appendFile(input.logPath, input.message).catch(() => undefined);
+    }
+    socketService.emitToRun(input.runId, "step:log", {
+      runId: input.runId,
+      itemId: input.itemId,
+      nodeId: input.nodeId,
+      stream: input.stream,
+      message: input.message,
+      timestamp: new Date().toISOString()
     });
   }
 

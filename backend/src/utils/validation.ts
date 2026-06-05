@@ -7,7 +7,8 @@ export const nodeInputSchema = z.object({
   type: z.enum(["file", "text", "number", "boolean"]).default("file"),
   flag: z.string().optional(),
   accept: z.array(z.string()).optional().default([]),
-  required: z.boolean().optional().default(false)
+  required: z.boolean().optional().default(false),
+  autoDownload: z.boolean().optional().default(false)
 });
 
 export const nodeOutputSchema = z.object({
@@ -15,7 +16,8 @@ export const nodeOutputSchema = z.object({
   type: z.enum(["file", "text"]).default("file"),
   flag: z.string().optional(),
   extension: z.string().optional(),
-  preview: z.enum(["video", "audio", "text", "json", "image"]).optional()
+  preview: z.enum(["video", "audio", "text", "json", "image"]).optional(),
+  autoDownload: z.boolean().optional().default(false)
 });
 
 export const workflowNodeSchema = z.object({

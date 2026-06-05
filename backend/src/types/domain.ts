@@ -21,6 +21,7 @@ export interface WorkflowInputDefinition {
   flag?: string;
   accept?: string[];
   required?: boolean;
+  autoDownload?: boolean;
 }
 
 export interface WorkflowOutputDefinition {
@@ -29,6 +30,7 @@ export interface WorkflowOutputDefinition {
   flag?: string;
   extension?: string;
   preview?: PreviewType;
+  autoDownload?: boolean;
 }
 
 export interface WorkflowNode {
@@ -92,6 +94,7 @@ export interface RunItem {
   startedAt?: Date;
   finishedAt?: Date;
   workingDir?: string;
+  exportDir?: string;
   inputFiles?: StoredFile[];
   inputValues?: RunInputValue[];
   outputFiles?: StoredFile[];

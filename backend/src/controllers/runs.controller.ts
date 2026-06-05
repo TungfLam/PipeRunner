@@ -11,6 +11,7 @@ import { HttpError } from "../utils/httpError";
 const runBodySchema = z.object({
   inputs: z.record(z.string(), z.union([z.string(), z.array(z.string())])).optional().default({}),
   textInputs: z.record(z.string(), z.array(z.string())).optional().default({}),
+  exportDirs: z.record(z.string(), z.array(z.string())).optional().default({}),
   params: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional().default({})
 });
 
@@ -32,6 +33,7 @@ export const createRun = asyncHandler<AuthenticatedRequest>(async (req, res: Res
   const body = runBodySchema.parse({
     inputs: parseJsonField(req.body.inputs),
     textInputs: parseJsonField(req.body.textInputs),
+    exportDirs: parseJsonField(req.body.exportDirs),
     params: parseJsonField(req.body.params)
   });
   const run = await workflowRunnerService.startRun({
@@ -39,6 +41,7 @@ export const createRun = asyncHandler<AuthenticatedRequest>(async (req, res: Res
     workflowId: req.params.workflowId,
     selectedInputs: body.inputs,
     textInputs: body.textInputs,
+    exportDirs: body.exportDirs,
     uploadedFiles: Array.isArray(req.files) ? req.files : [],
     params: body.params
   });

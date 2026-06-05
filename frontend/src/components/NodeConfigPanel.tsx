@@ -480,6 +480,16 @@ export function NodeConfigPanel({ node, step, logs, readOnly = false, onClose, o
                       }
                       label="Required"
                     />
+                    <FormControlLabel
+                      control={
+                        <Checkbox
+                          checked={Boolean(input.autoDownload)}
+                          disabled={readOnly || (input.type || "file") !== "file"}
+                          onChange={(event) => updateInput(index, { autoDownload: event.target.checked })}
+                        />
+                      }
+                      label="Auto download"
+                    />
                   </Stack>
                 </Stack>
               </Box>
@@ -584,6 +594,16 @@ export function NodeConfigPanel({ node, step, logs, readOnly = false, onClose, o
                       </MenuItem>
                     ))}
                   </TextField>
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={Boolean(output.autoDownload)}
+                        disabled={readOnly}
+                        onChange={(event) => updateOutput(index, { autoDownload: event.target.checked })}
+                      />
+                    }
+                    label="Auto download"
+                  />
                 </Stack>
               )}
             </Stack>
