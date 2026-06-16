@@ -91,7 +91,7 @@ class Semaphore {
 
 class WorkflowRunnerService {
   private activeChildren = new Map<string, Set<ChildProcessWithoutNullStreams>>();
-  private activeExecutions = new Set<string>();
+  private activeExecutionCounts = new Map<string, number>();
   private cancelledRuns = new Set<string>();
 
   async startRun(input: StartRunInput) {
@@ -218,16 +218,6 @@ class WorkflowRunnerService {
     if (!run) {
       throw new HttpError(404, "Run not found");
     }
-    if (run.status === "running" || run.status === "pending") {
-      throw new HttpError(409, "Cannot rerun while the workflow run is active");
-    }
-    if (run.status === "cancelled") {
-      this.requestStopActiveChildren(runId);
-      await this.waitForRunIdle(runId, 5000);
-    }
-    if (this.activeExecutions.has(runId) || (this.activeChildren.get(runId)?.size || 0) > 0) {
-      throw new HttpError(409, "Wait for the cancelled process to finish before rerunning");
-    }
     if (!run.items?.length) {
       throw new HttpError(400, "Rerun from step is available for batch runs only");
     }
@@ -254,6 +244,16 @@ class WorkflowRunnerService {
     }
 
     const runItem = run.items[itemIndex];
+    if (runItem.status === "running" || runItem.status === "pending") {
+      throw new HttpError(409, "Cannot rerun while this batch item is active");
+    }
+    if (run.status === "cancelled") {
+      this.requestStopActiveChildren(runId);
+      await this.waitForRunIdle(runId, 5000);
+      if (this.hasActiveRunProcesses(runId)) {
+        throw new HttpError(409, "Wait for the cancelled process to finish before rerunning");
+      }
+    }
     if (!runItem.workingDir) {
       throw new HttpError(400, "Batch item does not have a working directory");
     }
@@ -447,7 +447,7 @@ class WorkflowRunnerService {
     dirs: RunDirs;
     params: Record<string, string | number | boolean>;
   }) {
-    this.activeExecutions.add(input.runId);
+    this.startActiveExecution(input.runId);
     const semaphores = new Map(
       input.executionOrder.map((node) => [node.id, new Semaphore(Math.max(1, node.toolConfig.maxConcurrent || 1))])
     );
@@ -501,9 +501,8 @@ class WorkflowRunnerService {
       });
       socketService.emitToRun(input.runId, "run:finished", { runId: input.runId, status });
     } finally {
-      this.activeChildren.delete(input.runId);
-      this.activeExecutions.delete(input.runId);
-      this.cancelledRuns.delete(input.runId);
+      this.finishActiveExecution(input.runId);
+      this.cleanupRunTrackingIfIdle(input.runId);
     }
   }
 
@@ -519,7 +518,7 @@ class WorkflowRunnerService {
     existingOutputFiles: StoredFile[];
     params: Record<string, string | number | boolean>;
   }) {
-    this.activeExecutions.add(input.runId);
+    this.startActiveExecution(input.runId);
     const semaphores = new Map(
       input.executionOrder.map((node) => [node.id, new Semaphore(Math.max(1, node.toolConfig.maxConcurrent || 1))])
     );
@@ -555,9 +554,8 @@ class WorkflowRunnerService {
       });
       await this.finalizeRunAfterRerun(input.runId, input.userId, input.workflowRunDir);
     } finally {
-      this.activeChildren.delete(input.runId);
-      this.activeExecutions.delete(input.runId);
-      this.cancelledRuns.delete(input.runId);
+      this.finishActiveExecution(input.runId);
+      this.cleanupRunTrackingIfIdle(input.runId);
     }
   }
 
@@ -1109,13 +1107,38 @@ class WorkflowRunnerService {
 
   private async waitForRunIdle(runId: string, timeoutMs: number) {
     const deadline = Date.now() + timeoutMs;
-    while (this.activeExecutions.has(runId) || (this.activeChildren.get(runId)?.size || 0) > 0) {
+    while (this.hasActiveRunProcesses(runId)) {
       if (Date.now() >= deadline) {
         return false;
       }
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     return true;
+  }
+
+  private startActiveExecution(runId: string) {
+    this.activeExecutionCounts.set(runId, (this.activeExecutionCounts.get(runId) || 0) + 1);
+  }
+
+  private finishActiveExecution(runId: string) {
+    const nextCount = (this.activeExecutionCounts.get(runId) || 0) - 1;
+    if (nextCount > 0) {
+      this.activeExecutionCounts.set(runId, nextCount);
+      return;
+    }
+    this.activeExecutionCounts.delete(runId);
+  }
+
+  private hasActiveRunProcesses(runId: string) {
+    return (this.activeExecutionCounts.get(runId) || 0) > 0 || (this.activeChildren.get(runId)?.size || 0) > 0;
+  }
+
+  private cleanupRunTrackingIfIdle(runId: string) {
+    if (this.hasActiveRunProcesses(runId)) {
+      return;
+    }
+    this.activeChildren.delete(runId);
+    this.cancelledRuns.delete(runId);
   }
 
   private resolveNodeInputs(

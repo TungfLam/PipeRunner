@@ -358,7 +358,7 @@ export function RunPage() {
                     {["failed", "cancelled"].includes(step.status) &&
                       firstRerunnableStep?.nodeId === step.nodeId &&
                       selectedItem &&
-                      !["running", "pending"].includes(runQuery.data.status) && (
+                      !["running", "pending"].includes(selectedItem.status) && (
                       <Button
                         size="small"
                         color="secondary"
