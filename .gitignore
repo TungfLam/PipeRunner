@@ -5,3 +5,4 @@ dist/
 *.log
 data/
 backend/.cookies.json
+package-lock.json
