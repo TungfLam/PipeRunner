@@ -343,7 +343,7 @@ class WorkflowRunnerService {
     type BatchValue =
       | { kind: "upload"; inputName: string; file: Express.Multer.File; exportDir?: string }
       | { kind: "selected"; inputName: string; relativePath: string; exportDir?: string }
-      | { kind: "text"; inputName: string; value: string; exportDir?: string };
+      | { kind: "text"; inputName: string; value: string; exportRoot?: string };
 
     const valuesByInput = new Map<string, BatchValue[]>();
     const appendValue = (inputName: string, value: BatchValue) => {
@@ -367,9 +367,10 @@ class WorkflowRunnerService {
 
     for (const [inputName, textValues] of Object.entries(input.textInputs || {})) {
       const normalizedValues = (Array.isArray(textValues) ? textValues : [textValues]).map((item) => String(item).trim());
-      for (const [valueIndex, value] of normalizedValues.entries()) {
+      const exportRoot = input.exportDirs[inputName]?.find((value) => value?.trim())?.trim();
+      for (const value of normalizedValues) {
         if (!value) continue;
-        appendValue(inputName, { kind: "text", inputName, value, exportDir: input.exportDirs[inputName]?.[valueIndex] });
+        appendValue(inputName, { kind: "text", inputName, value, exportRoot });
       }
     }
 
@@ -379,6 +380,21 @@ class WorkflowRunnerService {
         throw new HttpError(400, `Input "${inputName}" has ${values.length} values, but this batch needs 1 or ${batchSize}`);
       }
     }
+
+    const configuredTextExportRoots = Array.from(valuesByInput.values())
+      .flatMap((values) => values)
+      .flatMap((value) => (value.kind === "text" && value.exportRoot ? [value.exportRoot] : []));
+    const relativeTextExportRoot = configuredTextExportRoots.find((exportRoot) => !path.isAbsolute(exportRoot));
+    if (relativeTextExportRoot) {
+      throw new HttpError(400, `Auto download root folder must be an absolute path: ${relativeTextExportRoot}`);
+    }
+    const textExportRoots = Array.from(new Set(configuredTextExportRoots.map((exportRoot) => path.resolve(exportRoot))));
+    if (textExportRoots.length > 1) {
+      throw new HttpError(400, "All text inputs must use the same auto download root folder");
+    }
+    const allocatedTextExportDirs = textExportRoots[0]
+      ? await this.allocateSequentialExportDirs(textExportRoots[0], batchSize)
+      : [];
 
     const items: PreparedRunItem[] = [];
     for (let index = 0; index < batchSize; index += 1) {
@@ -396,13 +412,13 @@ class WorkflowRunnerService {
       const inputFiles: StoredFile[] = [];
       const inputValues: RunInputValue[] = [];
       const labels: string[] = [];
-      const exportDirs: string[] = [];
+      const directExportDirs: string[] = [];
 
       for (const values of valuesByInput.values()) {
         const value = values[values.length === 1 ? 0 : index];
         if (!value) continue;
-        if (value.exportDir?.trim()) {
-          exportDirs.push(value.exportDir.trim());
+        if (value.kind !== "text" && value.exportDir?.trim()) {
+          directExportDirs.push(value.exportDir.trim());
         }
 
         if (value.kind === "upload") {
@@ -430,11 +446,46 @@ class WorkflowRunnerService {
         dirs,
         inputFiles,
         inputValues,
-        exportDir: exportDirs[0]
+        exportDir: allocatedTextExportDirs[index] || directExportDirs[0]
       });
     }
 
     return items;
+  }
+
+  private async allocateSequentialExportDirs(exportRoot: string, count: number) {
+    if (!path.isAbsolute(exportRoot)) {
+      throw new HttpError(400, `Auto download root folder must be an absolute path: ${exportRoot}`);
+    }
+
+    const resolvedRoot = path.resolve(exportRoot);
+    await fs.mkdir(resolvedRoot, { recursive: true });
+    const entries = await fs.readdir(resolvedRoot, { withFileTypes: true });
+    const largestFolderNumber = entries.reduce((largest, entry) => {
+      if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) {
+        return largest;
+      }
+      const folderNumber = Number(entry.name);
+      return Number.isSafeInteger(folderNumber) ? Math.max(largest, folderNumber) : largest;
+    }, 0);
+
+    const allocated: string[] = [];
+    let nextFolderNumber = largestFolderNumber + 1;
+    while (allocated.length < count) {
+      const candidate = path.join(resolvedRoot, String(nextFolderNumber));
+      nextFolderNumber += 1;
+      try {
+        await fs.mkdir(candidate);
+        allocated.push(candidate);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    return allocated;
   }
 
   private async executeRun(input: {

@@ -1,5 +1,4 @@
 import DeleteIcon from "@mui/icons-material/Delete";
-import AddIcon from "@mui/icons-material/Add";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
@@ -25,8 +24,9 @@ interface Props {
 export function RunDialog({ workflow, open, onClose }: Props) {
   const navigate = useNavigate();
   const [files, setFiles] = useState<Record<string, File[]>>({});
-  const [textInputs, setTextInputs] = useState<Record<string, string[]>>({});
+  const [textInputs, setTextInputs] = useState<Record<string, string>>({});
   const [exportDirs, setExportDirs] = useState<Record<string, string[]>>({});
+  const [textExportDirs, setTextExportDirs] = useState<Record<string, string>>({});
   const [paramsJson, setParamsJson] = useState("{}");
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
@@ -53,30 +53,6 @@ export function RunDialog({ workflow, open, onClose }: Props) {
       const items = current[inputName]?.length ? [...current[inputName]] : [""];
       items[index] = value;
       return { ...current, [inputName]: items };
-    });
-  };
-
-  const setTextItem = (inputName: string, index: number, value: string) => {
-    setTextInputs((current) => {
-      const items = current[inputName]?.length ? [...current[inputName]] : [""];
-      items[index] = value;
-      return { ...current, [inputName]: items };
-    });
-  };
-
-  const addTextItem = (inputName: string) => {
-    setTextInputs((current) => ({ ...current, [inputName]: [...(current[inputName] || [""]), ""] }));
-    setExportDirs((current) => ({ ...current, [inputName]: [...(current[inputName] || [""]), ""] }));
-  };
-
-  const removeTextItem = (inputName: string, index: number) => {
-    setTextInputs((current) => {
-      const nextItems = (current[inputName] || [""]).filter((_item, itemIndex) => itemIndex !== index);
-      return { ...current, [inputName]: nextItems.length ? nextItems : [""] };
-    });
-    setExportDirs((current) => {
-      const nextItems = (current[inputName] || [""]).filter((_item, itemIndex) => itemIndex !== index);
-      return { ...current, [inputName]: nextItems.length ? nextItems : [""] };
     });
   };
 
@@ -109,36 +85,31 @@ export function RunDialog({ workflow, open, onClose }: Props) {
     setError("");
     try {
       const formData = new FormData();
+      const parsedTextInputs = Object.fromEntries(
+        Object.entries(textInputs).map(([inputName, value]) => [
+          inputName,
+          value
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter(Boolean)
+        ])
+      );
       for (const [inputName, inputFiles] of Object.entries(files)) {
         for (const file of inputFiles || []) {
           formData.append(inputName, file);
         }
       }
-      formData.append(
-        "textInputs",
-        JSON.stringify(
-          Object.fromEntries(
-            Object.entries(textInputs).map(([inputName, values]) => [
-              inputName,
-              values
-                .map((line) => line.trim())
-                .filter(Boolean)
-            ])
-          )
-        )
-      );
+      formData.append("textInputs", JSON.stringify(parsedTextInputs));
       const exportDirPayload: Record<string, string[]> = {};
       for (const [inputName, inputFiles] of Object.entries(files)) {
         if (inputFiles.length) {
           exportDirPayload[inputName] = inputFiles.map((_file, index) => (exportDirs[inputName]?.[index] || "").trim());
         }
       }
-      for (const [inputName, values] of Object.entries(textInputs)) {
-        const dirsForText = values.flatMap((value, index) =>
-          value.trim() ? [(exportDirs[inputName]?.[index] || "").trim()] : []
-        );
-        if (dirsForText.length) {
-          exportDirPayload[inputName] = dirsForText;
+      for (const [inputName, values] of Object.entries(parsedTextInputs)) {
+        const exportRoot = (textExportDirs[inputName] || "").trim();
+        if (values.length > 0 && exportRoot) {
+          exportDirPayload[inputName] = [exportRoot];
         }
       }
       formData.append("exportDirs", JSON.stringify(exportDirPayload));
@@ -165,57 +136,39 @@ export function RunDialog({ workflow, open, onClose }: Props) {
           ) : (
             requiredInputs.map((input) => {
               const selectedFiles = files[input.name] || [];
-              const textItems = textInputs[input.name]?.length ? textInputs[input.name] : [""];
               const itemExportDirs = exportDirs[input.name] || [];
               if (input.type === "text") {
+                const textValue = textInputs[input.name] || "";
+                const itemCount = textValue
+                  .split(/\r?\n/)
+                  .map((line) => line.trim())
+                  .filter(Boolean).length;
                 return (
                   <Box key={input.name}>
                     <Stack spacing={1}>
-                      <Stack direction="row" spacing={1} alignItems="center">
-                        <Typography variant="subtitle2" sx={{ flexGrow: 1 }}>
-                          {input.name}
-                          {input.required ? " *" : ""}
-                        </Typography>
-                        <Button size="small" startIcon={<AddIcon />} variant="outlined" onClick={() => addTextItem(input.name)}>
-                          Item
-                        </Button>
-                      </Stack>
-                      {textItems.map((value, index) => (
-                        <Stack
-                          key={`${input.name}-text-${index}`}
-                          direction={{ xs: "column", sm: "row" }}
-                          spacing={1}
-                          alignItems={{ xs: "stretch", sm: "flex-start" }}
-                        >
-                          <TextField
-                            label={`Item ${index + 1}`}
-                            placeholder="https://example.com/item"
-                            value={value}
-                            onChange={(event) => setTextItem(input.name, index, event.target.value)}
-                            size="small"
-                            fullWidth
-                            helperText={index === 0 ? "Each item becomes one batch item. The value is passed as a string." : " "}
-                          />
-                          <TextField
-                            label="Auto download folder"
-                            placeholder="/home/tungflam/Downloads/workflow-output"
-                            value={itemExportDirs[index] || ""}
-                            onChange={(event) => setExportDir(input.name, index, event.target.value)}
-                            size="small"
-                            fullWidth
-                            helperText={index === 0 ? "Optional absolute folder path." : " "}
-                          />
-                          <IconButton
-                            size="small"
-                            color="error"
-                            onClick={() => removeTextItem(input.name, index)}
-                            disabled={textItems.length === 1 && !value}
-                            sx={{ mt: 0.5 }}
-                          >
-                            <DeleteIcon fontSize="small" />
-                          </IconButton>
-                        </Stack>
-                      ))}
+                      <TextField
+                        label={`${input.name}${input.required ? " *" : ""}`}
+                        placeholder={"https://example.com/item-1\nhttps://example.com/item-2\nhttps://example.com/item-3"}
+                        value={textValue}
+                        onChange={(event) =>
+                          setTextInputs((current) => ({ ...current, [input.name]: event.target.value }))
+                        }
+                        minRows={5}
+                        multiline
+                        fullWidth
+                        helperText={`${itemCount} item${itemCount === 1 ? "" : "s"}. Each non-empty line becomes one batch item.`}
+                      />
+                      <TextField
+                        label="Auto download root folder"
+                        placeholder="/home/tungflam/Downloads/workflow-output"
+                        value={textExportDirs[input.name] || ""}
+                        onChange={(event) =>
+                          setTextExportDirs((current) => ({ ...current, [input.name]: event.target.value }))
+                        }
+                        size="small"
+                        fullWidth
+                        helperText="Optional absolute path. Numbered folders are created from the next available number, one per item."
+                      />
                     </Stack>
                   </Box>
                 );
