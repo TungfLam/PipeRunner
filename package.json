@@ -7,6 +7,9 @@
     "frontend"
   ],
   "scripts": {
+    "test": "tsx --test backend/tests/*.test.ts",
+    "test:e2e": "npm run build -w backend && node scripts/run-qa.mjs",
+    "test:performance": "node scripts/run-performance.mjs",
     "dev": "concurrently \"npm run dev -w backend\" \"npm run dev -w frontend\"",
     "dev:backend": "npm run dev -w backend",
     "dev:frontend": "npm run dev -w frontend",
@@ -14,6 +17,7 @@
     "typecheck": "npm run typecheck -w backend && npm run typecheck -w frontend"
   },
   "devDependencies": {
+    "@playwright/test": "^1.64.1",
     "concurrently": "^8.2.2"
   }
 }

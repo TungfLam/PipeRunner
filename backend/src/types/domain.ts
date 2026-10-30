@@ -3,8 +3,8 @@ import type { Types } from "mongoose";
 export type MongoId = Types.ObjectId | string;
 
 export type PreviewType = "video" | "audio" | "text" | "json" | "image";
-export type RunStatus = "pending" | "running" | "success" | "failed" | "cancelled";
-export type StepStatus = "waiting" | "running" | "success" | "failed" | "skipped" | "cancelled";
+export type RunStatus = "await" | "running" | "success" | "failed" | "cancelled";
+export type StepStatus = "await" | "running" | "success" | "failed" | "skipped" | "cancelled";
 
 export interface ToolCommandConfig {
   bin: string;
@@ -72,6 +72,7 @@ export interface RunInputValue {
 }
 
 export interface RunStep {
+  attemptId?: string;
   nodeId: string;
   label: string;
   status: StepStatus;
@@ -87,6 +88,10 @@ export interface RunStep {
 }
 
 export interface RunItem {
+  attemptId?: string;
+  waitReason?: string;
+  cancelRequestedAt?: Date;
+  process?: { pid: number; startTime?: string; bootId?: string };
   itemId: string;
   index: number;
   label: string;

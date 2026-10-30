@@ -1,7 +1,8 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import fsSync, { createWriteStream } from "fs";
 import fs from "fs/promises";
+import { finished } from "stream/promises";
 import path from "path";
+import { randomUUID } from "crypto";
 import type { Express } from "express";
 import { Types } from "mongoose";
 import { ProjectModel } from "../models/Project";
@@ -14,321 +15,385 @@ import { workflowGraphSchema } from "../utils/validation";
 import { repairWorkflowGraphHandles } from "../utils/workflowHandles";
 import { fileStorageService, sanitizeFileName } from "./fileStorage.service";
 import { socketService } from "./socket.service";
+import { executionScheduler } from "./executionScheduler";
+import { aggregateStatus, aggregateSteps, isActiveStatus, recoverRun } from "./runState";
+import { runSupervisedCommand, stopOwnedProcess } from "./processRunner";
 
 interface StartRunInput {
-  userId: string;
-  workflowId: string;
-  selectedInputs: Record<string, string | string[]>;
-  textInputs: Record<string, string[]>;
-  exportDirs: Record<string, string[]>;
-  uploadedFiles: Express.Multer.File[];
-  params: Record<string, string | number | boolean>;
+  userId: string; workflowId: string; selectedInputs: Record<string, string | string[]>;
+  textInputs: Record<string, string[]>; exportDirs: Record<string, string[]>;
+  uploadedFiles: Express.Multer.File[]; params: Record<string, string | number | boolean>;
 }
-
-interface RunDirs {
-  runDir: string;
-  inputDir: string;
-  outputDir: string;
-  tempDir: string;
-  logsDir: string;
-}
-
+interface RunDirs { runDir: string; inputDir: string; outputDir: string; tempDir: string; logsDir: string }
 interface PreparedRunItem {
-  itemId: string;
-  index: number;
-  label: string;
-  dirs: RunDirs;
-  inputFiles: StoredFile[];
-  inputValues: RunInputValue[];
-  exportDir?: string;
+  itemId: string; index: number; label: string; dirs: RunDirs;
+  inputFiles: StoredFile[]; inputValues: RunInputValue[]; exportDir?: string;
 }
-
-interface ResolvedValues {
-  stepByName: Record<string, string>;
-  templateByName: Record<string, string>;
-}
-
+interface ResolvedValues { stepByName: Record<string, string>; templateByName: Record<string, string> }
 interface NodeOutputValues extends ResolvedValues {}
-
-class CancelledRunError extends Error {
-  constructor() {
-    super("Run cancelled");
-  }
+interface Graph { name?: string; nodes: WorkflowNode[]; edges: WorkflowEdge[] }
+interface StoredRun {
+  _id: unknown; userId: unknown; projectId: unknown; workflowId: unknown;
+  status: string; items: RunItem[]; steps: RunStep[]; inputFiles: StoredFile[]; outputFiles: StoredFile[];
+  workingDir?: string; startedAt?: Date; finishedAt?: Date; errorMessage?: string;
+  workflowSnapshot?: Graph; params: Record<string, string | number | boolean>; revision?: number;
 }
-
-class CommandFailedError extends Error {
-  constructor(
-    message: string,
-    public exitCode?: number | null
-  ) {
-    super(message);
-  }
+interface Execution {
+  runId: string; userId: string; workflowId: string; item: PreparedRunItem; attemptId: string;
+  controller: AbortController; done: Promise<void>; graph: Graph; order: WorkflowNode[];
+  startIndex: number; previousSteps: RunStep[]; outputs: StoredFile[]; failure?: Error;
 }
+export interface BatchResult { acceptedItemIds: string[]; skipped: Array<{ itemId: string; reason: string }> }
 
-class Semaphore {
-  private active = 0;
-  private queue: Array<() => void> = [];
+export class WorkflowRunnerService {
+  private executions = new Map<string, Execution>();
+  private locks = new Map<string, Promise<unknown>>();
+  private shuttingDown = false;
+  private limitVersions = new Map<string, number>();
 
-  constructor(private readonly limit: number) {}
-
-  async acquire() {
-    if (this.active < this.limit) {
-      this.active += 1;
-      return;
+  private key(runId: string, itemId: string) { return `${runId}:${itemId}`; }
+  private async locked<T>(runId: string, action: () => Promise<T>): Promise<T> {
+    const previous = this.locks.get(runId) || Promise.resolve();
+    const next = previous.catch(() => undefined).then(action);
+    this.locks.set(runId, next);
+    try { return await next; }
+    finally { if (this.locks.get(runId) === next) this.locks.delete(runId); }
+  }
+  private async readRun(userId: string, runId: string) {
+    const run = await RunModel.findOne({ _id: runId, userId }).lean();
+    if (!run) throw new HttpError(404, "Run not found");
+    const stored = run as unknown as StoredRun;
+    stored.items ||= []; stored.steps ||= []; stored.inputFiles ||= []; stored.outputFiles ||= []; stored.params ||= {};
+    return stored;
+  }
+  /** All item mutations and aggregation are serialized; never hold this lock while a command runs. */
+  private async mutate(userId: string, runId: string, itemId: string | undefined,
+    attemptId: string | undefined, change: (run: StoredRun, item?: RunItem) => void) {
+    return this.locked(runId, async () => {
+      const run = await this.readRun(userId, runId);
+      const item = itemId ? run.items.find((value) => value.itemId === itemId) : undefined;
+      if (itemId && (!item || (attemptId && item.attemptId !== attemptId))) return run;
+      change(run, item);
+      await this.persist(run, itemId ? [itemId] : undefined);
+      return run;
+    });
+  }
+  private async persist(run: StoredRun, changedIds?: string[]) {
+    if (run.items.length) {
+      run.status = aggregateStatus(run.items.map((item) => item.status));
+      run.steps = aggregateSteps(run.items);
+      run.outputFiles = run.items.flatMap((item) => item.outputFiles || []);
+      const starts = run.items.flatMap((item) => item.startedAt ? [new Date(item.startedAt).getTime()] : []);
+      if (!run.startedAt && starts.length) run.startedAt = new Date(Math.min(...starts));
+      run.finishedAt = isActiveStatus(run.status) ? undefined : run.finishedAt || new Date();
+      const failed = run.items.filter((item) => item.status === "failed").length;
+      run.errorMessage = !isActiveStatus(run.status) && failed ? `${failed} job(s) failed` : undefined;
     }
-    await new Promise<void>((resolve) => this.queue.push(resolve));
-    this.active += 1;
-  }
-
-  release() {
-    this.active = Math.max(0, this.active - 1);
-    const next = this.queue.shift();
-    if (next) {
-      next();
+    run.revision = (run.revision || 0) + 1;
+    const values = { items: run.items, steps: run.steps, outputFiles: run.outputFiles,
+      status: run.status, revision: run.revision, startedAt: run.startedAt,
+      finishedAt: run.finishedAt, errorMessage: run.errorMessage, workflowSnapshot: run.workflowSnapshot };
+    const unset = Object.fromEntries(Object.entries(values).filter(([, value]) => value === undefined).map(([key]) => [key, ""]));
+    const set = Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined));
+    await RunModel.updateOne({ _id: run._id, userId: run.userId }, { $set: set, ...(Object.keys(unset).length ? { $unset: unset } : {}) });
+    socketService.emitToRun(String(run._id), "run:patch", {
+      runId: String(run._id), revision: run.revision,
+      run: { status: run.status, startedAt: run.startedAt || null, finishedAt: run.finishedAt || null, errorMessage: run.errorMessage || null },
+      items: changedIds ? run.items.filter((item) => changedIds.includes(item.itemId)) : run.items,
+      steps: run.steps
+    });
+    if (!isActiveStatus(run.status) && run.workingDir) {
+      await fileStorageService.writeManifest(fileStorageService.resolveRelativePath(run.workingDir), run).catch((error) => console.error("Manifest write failed", error));
     }
   }
-}
-
-class WorkflowRunnerService {
-  private activeChildren = new Map<string, Set<ChildProcessWithoutNullStreams>>();
-  private activeExecutionCounts = new Map<string, number>();
-  private cancelledRuns = new Set<string>();
-
+  updateLimits(userId: string, workflowId: string, nodes: WorkflowNode[], updatedAt?: Date) {
+    const key = `${userId}:${workflowId}`;
+    const version = updatedAt ? new Date(updatedAt).getTime() : 0;
+    if (version < (this.limitVersions.get(key) || 0)) return;
+    this.limitVersions.set(key, version);
+    for (const node of nodes) executionScheduler.setLimit(`${userId}:${workflowId}:${node.id}`, node.toolConfig.maxConcurrent || 1);
+  }
   async startRun(input: StartRunInput) {
+    if (this.shuttingDown) throw new HttpError(503, "Backend is shutting down");
     const workflow = await WorkflowModel.findOne({ _id: input.workflowId, userId: input.userId }).lean();
-    if (!workflow) {
-      throw new HttpError(404, "Workflow not found");
-    }
-
-    const project = await ProjectModel.findOne({ _id: workflow.projectId, userId: input.userId }).select("_id").lean();
-    if (!project) {
-      throw new HttpError(404, "Project not found");
-    }
-
-    const parsedGraph = repairWorkflowGraphHandles(workflowGraphSchema.parse({ nodes: workflow.nodes, edges: workflow.edges }));
-    const executionOrder = this.resolveExecutionOrder(parsedGraph.nodes, parsedGraph.edges);
-    const steps: RunStep[] = executionOrder.map((node) => ({
-      nodeId: node.id,
-      label: node.label,
-      status: "waiting"
-    }));
-
-    const run = await RunModel.create({
-      userId: new Types.ObjectId(input.userId),
-      projectId: workflow.projectId,
-      workflowId: workflow._id,
-      status: "pending",
-      inputFiles: [],
-      outputFiles: [],
-      steps,
-      params: input.params
-    });
-
-    const runId = String(run._id);
-    socketService.emitToRun(runId, "run:created", { runId, status: "pending" });
-
+    if (!workflow) throw new HttpError(404, "Workflow not found");
+    if (!await ProjectModel.exists({ _id: workflow.projectId, userId: input.userId })) throw new HttpError(404, "Project not found");
+    const graph: Graph = { ...repairWorkflowGraphHandles(workflowGraphSchema.parse(workflow)), name: workflow.name };
+    const order = this.resolveExecutionOrder(graph.nodes, graph.edges);
+    if (!order.length) throw new HttpError(400, "Workflow has no steps");
+    const runId = String(new Types.ObjectId());
     const dirs = await fileStorageService.createRunDirs(input.userId, String(workflow.projectId), runId);
-    const items = await this.prepareRunItems({
-      userId: input.userId,
-      runDir: dirs.runDir,
-      selectedInputs: input.selectedInputs,
-      textInputs: input.textInputs,
-      exportDirs: input.exportDirs,
-      uploadedFiles: input.uploadedFiles,
-      steps
+    let prepared: PreparedRunItem[];
+    try { prepared = await this.prepareRunItems({ ...input, runDir: dirs.runDir, steps: [] }); }
+    catch (error) {
+      await fileStorageService.removeRelativePath(input.userId, fileStorageService.relativeFromAbsolute(dirs.runDir)).catch(() => undefined);
+      throw error;
+    }
+    if (this.shuttingDown) throw new HttpError(503, "Backend is shutting down");
+    const items: RunItem[] = prepared.map((item) => {
+      const attemptId = randomUUID();
+      return { itemId: item.itemId, index: item.index, label: item.label, attemptId, status: "await",
+        workingDir: fileStorageService.relativeFromAbsolute(item.dirs.runDir), exportDir: item.exportDir,
+        inputFiles: item.inputFiles, inputValues: item.inputValues, outputFiles: [],
+        steps: order.map((node) => ({ nodeId: node.id, label: node.label, status: "await", attemptId })) };
     });
-    const inputFiles = items.flatMap((item) => item.inputFiles);
-    const runItems: RunItem[] = items.map((item) => ({
-      itemId: item.itemId,
-      index: item.index,
-      label: item.label,
-      status: "pending",
-      workingDir: fileStorageService.relativeFromAbsolute(item.dirs.runDir),
-      exportDir: item.exportDir,
-      inputFiles: item.inputFiles,
-      inputValues: item.inputValues,
-      outputFiles: [],
-      steps: steps.map((step) => ({ ...step }))
-    }));
-
-    await RunModel.updateOne(
-      { _id: runId, userId: input.userId },
-      {
-        $set: {
-          status: "running",
-          startedAt: new Date(),
-          workingDir: fileStorageService.relativeFromAbsolute(dirs.runDir),
-          inputFiles,
-          items: runItems
+    const latest = await WorkflowModel.findOne({ _id: input.workflowId, userId: input.userId }).lean();
+    this.updateLimits(input.userId, input.workflowId, latest ? workflowGraphSchema.parse(latest).nodes : graph.nodes, latest?.updatedAt);
+    await RunModel.create({ _id: runId, userId: input.userId, projectId: workflow.projectId,
+      workflowId: workflow._id, workflowSnapshot: graph, status: "await", revision: 0,
+      workingDir: fileStorageService.relativeFromAbsolute(dirs.runDir),
+      inputFiles: prepared.flatMap((item) => item.inputFiles), outputFiles: [], steps: aggregateSteps(items), items, params: input.params });
+    for (const item of prepared) this.launch({ runId, userId: input.userId, workflowId: input.workflowId,
+      item, attemptId: items[item.index].attemptId!, graph, order, startIndex: 0, previousSteps: [], outputs: [] });
+    return this.readRun(input.userId, runId);
+  }
+  async cancelRun(userId: string, runId: string, itemIds?: string[]) {
+    const acceptedItemIds: string[] = [];
+    const skipped: BatchResult["skipped"] = [];
+    const contexts: Execution[] = [];
+    await this.mutate(userId, runId, undefined, undefined, (run) => {
+      for (const itemId of [...new Set(itemIds || run.items.filter((item) => isActiveStatus(item.status)).map((item) => item.itemId))]) {
+        const item = run.items.find((value) => value.itemId === itemId);
+        if (!item) { skipped.push({ itemId, reason: "not_found" }); continue; }
+        if (!isActiveStatus(item.status)) { skipped.push({ itemId, reason: "job_is_finished" }); continue; }
+        acceptedItemIds.push(itemId);
+        item.cancelRequestedAt = new Date();
+        const execution = this.executions.get(this.key(runId, itemId));
+        if (execution) { contexts.push(execution); execution.controller.abort(new Error("Job cancelled")); }
+        else {
+          item.status = "cancelled"; item.finishedAt = new Date(); item.errorMessage = "Job cancelled";
+          item.steps = item.steps.map((step) => isActiveStatus(step.status) ? { ...step, status: "cancelled", finishedAt: new Date() } : step);
         }
       }
-    );
-
-    socketService.emitToRun(runId, "run:status", { runId, status: "running", startedAt: new Date() });
-    void this.executeRun({
-      runId,
-      userId: input.userId,
-      nodes: parsedGraph.nodes,
-      edges: parsedGraph.edges,
-      executionOrder,
-      items,
-      dirs,
-      params: input.params
-    });
-
-    return RunModel.findOne({ _id: runId, userId: input.userId }).lean();
-  }
-
-  async cancelRun(userId: string, runId: string) {
-    const run = await RunModel.findOne({ _id: runId, userId }).lean();
-    if (!run) {
-      throw new HttpError(404, "Run not found");
-    }
-
-    this.cancelledRuns.add(runId);
-    this.requestStopActiveChildren(runId);
-
-    const steps = (run.steps || []).map((step) =>
-      ["waiting", "running"].includes(step.status)
-        ? { ...step, status: "cancelled", finishedAt: new Date(), errorMessage: "Run cancelled" }
-        : step
-    );
-    const items = (run.items || []).map((item) => ({
-      ...item,
-      status: ["pending", "running"].includes(item.status) ? "cancelled" : item.status,
-      finishedAt: item.finishedAt || new Date(),
-      errorMessage: item.errorMessage || "Run cancelled",
-      steps: (item.steps || []).map((step) =>
-        ["waiting", "running"].includes(step.status)
-          ? { ...step, status: "cancelled", finishedAt: new Date(), errorMessage: "Run cancelled" }
-          : step
-      )
-    }));
-
-    await RunModel.updateOne(
-      { _id: runId, userId },
-      { $set: { status: "cancelled", finishedAt: new Date(), steps, items, errorMessage: "Run cancelled" } }
-    );
-    socketService.emitToRun(runId, "run:finished", { runId, status: "cancelled" });
-    return RunModel.findOne({ _id: runId, userId }).lean();
-  }
-
-  async rerunFromNode(userId: string, runId: string, nodeId: string, itemId?: string) {
-    const run = await RunModel.findOne({ _id: runId, userId }).lean();
-    if (!run) {
-      throw new HttpError(404, "Run not found");
-    }
-    if (!run.items?.length) {
-      throw new HttpError(400, "Rerun from step is available for batch runs only");
-    }
-
-    const workflow = await WorkflowModel.findOne({ _id: run.workflowId, userId }).lean();
-    if (!workflow) {
-      throw new HttpError(404, "Workflow not found");
-    }
-
-    const parsedGraph = repairWorkflowGraphHandles(workflowGraphSchema.parse({ nodes: workflow.nodes, edges: workflow.edges }));
-    const executionOrder = this.resolveExecutionOrder(parsedGraph.nodes, parsedGraph.edges);
-    const startIndex = executionOrder.findIndex((node) => node.id === nodeId);
-    if (startIndex === -1) {
-      throw new HttpError(400, "Selected node is not in the workflow");
-    }
-
-    const itemIndex = itemId
-      ? run.items.findIndex((item) => item.itemId === itemId)
-      : run.items.length === 1
-        ? 0
-        : -1;
-    if (itemIndex === -1) {
-      throw new HttpError(400, "Batch item is required for rerun");
-    }
-
-    const runItem = run.items[itemIndex];
-    if (runItem.status === "running" || runItem.status === "pending") {
-      throw new HttpError(409, "Cannot rerun while this batch item is active");
-    }
-    if (run.status === "cancelled") {
-      this.requestStopActiveChildren(runId);
-      await this.waitForRunIdle(runId, 5000);
-      if (this.hasActiveRunProcesses(runId)) {
-        throw new HttpError(409, "Wait for the cancelled process to finish before rerunning");
+      if (!run.items.length && isActiveStatus(run.status)) {
+        run.status = "cancelled"; run.finishedAt = new Date();
+        run.steps = run.steps.map((step) => isActiveStatus(step.status) ? { ...step, status: "cancelled", finishedAt: new Date() } : step);
       }
-    }
-    if (!runItem.workingDir) {
-      throw new HttpError(400, "Batch item does not have a working directory");
-    }
-    const runItemSteps = (runItem.steps?.length ? runItem.steps : run.steps || []).map((step) => this.normalizeRunStep(step));
-    const stepsByNodeId = new Map(runItemSteps.map((step) => [step.nodeId, step]));
-    const firstBlockedIndex = executionOrder.findIndex((node) => {
-      const status = stepsByNodeId.get(node.id)?.status;
-      return status === "failed" || status === "cancelled";
     });
-    if (firstBlockedIndex !== -1 && startIndex > firstBlockedIndex) {
-      throw new HttpError(400, "Rerun from the first failed or cancelled step first");
+    await Promise.all(contexts.map((execution) => execution.done));
+    return { run: await this.readRun(userId, runId), acceptedItemIds, skipped };
+  }
+  async rerunFromNode(userId: string, runId: string, nodeId?: string, itemId?: string, itemIds?: string[]) {
+    if (this.shuttingDown) throw new HttpError(503, "Backend is shutting down");
+    const acceptedItemIds: string[] = [];
+    const skipped: BatchResult["skipped"] = [];
+    await this.locked(runId, async () => {
+      const run = await this.readRun(userId, runId);
+      const current = await WorkflowModel.findOne({ _id: run.workflowId, userId }).lean();
+      const graph = run.workflowSnapshot || (current ? { ...repairWorkflowGraphHandles(workflowGraphSchema.parse(current)), name: current.name } : undefined);
+      if (!graph) throw new HttpError(404, "Workflow configuration not found");
+      const order = this.resolveExecutionOrder(graph.nodes, graph.edges);
+      this.updateLimits(userId, String(run.workflowId), current ? workflowGraphSchema.parse(current).nodes : graph.nodes, current?.updatedAt);
+      if (!run.items.length && run.workingDir) {
+        run.items = [{ itemId: "legacy", index: 0, label: "Job 1", status: run.status as RunItem["status"],
+          workingDir: run.workingDir, steps: run.steps, inputFiles: run.inputFiles, outputFiles: run.outputFiles }];
+      }
+      const ids = [...new Set(itemIds || (itemId ? [itemId] : run.items.filter((item) => ["failed", "cancelled"].includes(item.status)).map((item) => item.itemId)))];
+      const launch: Array<Omit<Execution, "controller" | "done">> = [];
+      for (const id of ids) {
+        const item = run.items.find((value) => value.itemId === id);
+        try {
+          if (!item) throw new Error("not_found");
+          if (!["failed", "cancelled"].includes(item.status) || this.executions.has(this.key(runId, id))) throw new Error("job_is_active_or_not_rerunnable");
+          if (!item.workingDir) throw new Error("Job has no working directory");
+          const byNode = new Map(item.steps.map((step) => [step.nodeId, step]));
+          if (!run.workflowSnapshot && (order.length !== item.steps.length || order.some((node) => !byNode.has(node.id)))) {
+            throw new Error("Workflow structure changed; restore the original workflow or start a new run");
+          }
+          const blocked = order.findIndex((node) => byNode.get(node.id)?.status !== "success");
+          const startIndex = nodeId ? order.findIndex((node) => node.id === nodeId) : blocked;
+          if (startIndex < 0 || (blocked >= 0 && startIndex > blocked)) throw new Error("Rerun from the first failed or cancelled step first");
+          for (const file of item.inputFiles || []) {
+            fileStorageService.assertUserOwnsPath(userId, file.relativePath);
+            await fs.access(fileStorageService.resolveRelativePath(file.relativePath));
+          }
+          for (const node of order.slice(0, startIndex)) {
+            const step = byNode.get(node.id);
+            if (!step || step.status !== "success") throw new Error(`Step ${node.label} has no reusable result`);
+            for (const output of node.outputs.filter((output) => output.type === "file")) {
+              const relative = step.outputs?.[output.name];
+              if (!relative) throw new Error(`Missing previous output ${node.label}/${output.name}`);
+              fileStorageService.assertUserOwnsPath(userId, relative);
+              await fs.access(fileStorageService.resolveRelativePath(relative));
+            }
+          }
+          const attemptId = randomUUID();
+          const root = fileStorageService.resolveRelativePath(item.workingDir);
+          const dirs = { runDir: root, inputDir: path.join(root, "input"), tempDir: path.join(root, "temp", attemptId),
+            outputDir: path.join(root, "output", attemptId), logsDir: path.join(root, "logs", attemptId) };
+          await Promise.all(Object.values(dirs).map((dir) => fs.mkdir(dir, { recursive: true })));
+          const previousSteps = item.steps;
+          const retainedPaths = new Set(order.slice(0, startIndex).flatMap((node) => Object.values(byNode.get(node.id)?.outputs || {})));
+          const outputs = (item.outputFiles || []).filter((file) => retainedPaths.has(file.relativePath));
+          item.steps = order.map((node, index) => index < startIndex ? byNode.get(node.id)! : { nodeId: node.id, label: node.label, status: "await", attemptId });
+          Object.assign(item, { status: "await", attemptId, outputFiles: outputs });
+          delete item.startedAt; delete item.finishedAt; delete item.errorMessage; delete item.cancelRequestedAt; delete item.waitReason; delete item.process;
+          acceptedItemIds.push(id);
+          launch.push({ runId, userId, workflowId: String(run.workflowId), graph, order, attemptId, startIndex, previousSteps, outputs,
+            item: { itemId: id, index: item.index, label: item.label, dirs,
+              inputFiles: (item.inputFiles || []).map((file) => this.normalizeStoredFile(file)), inputValues: item.inputValues || [], exportDir: item.exportDir } });
+        } catch (error) { skipped.push({ itemId: id, reason: error instanceof Error ? error.message : "Rerun failed" }); }
+      }
+      if (acceptedItemIds.length) {
+        run.workflowSnapshot ||= graph;
+        delete run.finishedAt; delete run.errorMessage;
+        await this.persist(run, acceptedItemIds);
+        // Register every context before releasing the admission lock.
+        for (const input of launch) this.launch(input);
+      }
+    });
+    return { run: await this.readRun(userId, runId), acceptedItemIds, skipped };
+  }
+  private launch(input: Omit<Execution, "controller" | "done">) {
+    const execution: Execution = { ...input, controller: new AbortController(), done: Promise.resolve() };
+    if (this.shuttingDown) execution.controller.abort(new Error("Backend stopped; rerun to continue"));
+    this.executions.set(this.key(input.runId, input.item.itemId), execution);
+    execution.done = this.executeItem(execution).catch((error) => console.error("Execution persistence failed", error)).finally(() => {
+      if (this.executions.get(this.key(input.runId, input.item.itemId)) === execution) this.executions.delete(this.key(input.runId, input.item.itemId));
+    });
+  }
+  private async changeItem(execution: Execution, change: (item: RunItem) => void) {
+    return this.mutate(execution.userId, execution.runId, execution.item.itemId, execution.attemptId, (_run, item) => {
+      if (item!.status === "cancelled" && !execution.controller.signal.aborted) {
+        execution.controller.abort(new Error("Job cancelled"));
+        return;
+      }
+      change(item!);
+    });
+  }
+  private async executeItem(execution: Execution) {
+    const { item, order, graph, controller, runId, userId } = execution;
+    const files = new Map(item.inputFiles.map((file) => [file.name, file.relativePath]));
+    const texts = new Map(item.inputValues.map((value) => [value.name, value.value]));
+    const nodeOutputs = new Map<string, NodeOutputValues>();
+    for (const node of order.slice(0, execution.startIndex)) {
+      const step = execution.previousSteps.find((step) => step.nodeId === node.id)!;
+      const values = step.outputs || {};
+      nodeOutputs.set(node.id, { stepByName: values, templateByName: Object.fromEntries(Object.entries(values).map(([name, value]) => [name,
+        node.outputs.find((output) => output.name === name)?.type === "file" ? fileStorageService.resolveRelativePath(value) : value])) });
     }
-
-    const itemRoot = fileStorageService.resolveRelativePath(runItem.workingDir);
-    const item: PreparedRunItem = {
-      itemId: runItem.itemId,
-      index: runItem.index,
-      label: runItem.label,
-      dirs: {
-        runDir: itemRoot,
-        inputDir: path.join(itemRoot, "input"),
-        outputDir: path.join(itemRoot, "output"),
-        tempDir: path.join(itemRoot, "temp"),
-        logsDir: path.join(itemRoot, "logs")
-      },
-      inputFiles: (runItem.inputFiles || []).map((file) => this.normalizeStoredFile(file)),
-      inputValues: (runItem.inputValues || []).map((value) => ({
-        name: String(value.name),
-        type: "text",
-        value: String(value.value)
-      })),
-      exportDir: runItem.exportDir || undefined
-    };
-
-    const existingItemOutputs = (runItem.outputFiles || []).map((file) => this.normalizeStoredFile(file));
-    const existingRunOutputs = (run.outputFiles || []).map((file) => this.normalizeStoredFile(file));
-    const nextSteps = this.stepsForRerun(executionOrder, runItemSteps, startIndex);
-    this.cancelledRuns.delete(runId);
-
-    await RunModel.updateOne(
-      { _id: runId, userId, [`items.${itemIndex}`]: { $exists: true } },
-      {
-        $set: {
-          status: "running",
-          outputFiles: existingRunOutputs,
-          [`items.${itemIndex}.status`]: "running",
-          [`items.${itemIndex}.startedAt`]: new Date(),
-          [`items.${itemIndex}.outputFiles`]: existingItemOutputs,
-          [`items.${itemIndex}.steps`]: nextSteps
-        },
-        $unset: {
-          finishedAt: "",
-          errorMessage: "",
-          [`items.${itemIndex}.finishedAt`]: "",
-          [`items.${itemIndex}.errorMessage`]: ""
+    let activeIndex = execution.startIndex;
+    try {
+      for (let index = execution.startIndex; index < order.length; index++) {
+        activeIndex = index;
+        controller.signal.throwIfAborted();
+        const node = order[index];
+        if (node.type === "fileInput") {
+          const outputs = this.resolveInputNode(node, files, texts);
+          await this.copyAutoDownloadFiles({ runId, userId, itemId: item.itemId, node, exportDir: item.exportDir,
+            resolvedInputs: { stepByName: {}, templateByName: {} }, resolvedOutputs: { relativeByName: outputs.stepByName, absoluteByName: outputs.templateByName } });
+          controller.signal.throwIfAborted();
+          await this.changeItem(execution, (current) => Object.assign(current.steps[index], { status: "success", startedAt: new Date(), finishedAt: new Date(), outputs: outputs.stepByName }));
+          nodeOutputs.set(node.id, outputs);
+          continue;
         }
+        await this.changeItem(execution, (current) => { current.status = "await"; current.waitReason = `Waiting for ${node.label}`; });
+        const release = await executionScheduler.acquire(`${userId}:${execution.workflowId}:${node.id}`, controller.signal);
+        try {
+          controller.signal.throwIfAborted();
+          const inputs = this.resolveNodeInputs(node, graph.edges, nodeOutputs, files, texts);
+          const outputs = this.buildNodeOutputs(node, item.dirs.outputDir);
+          await this.runNode(execution, index, inputs, outputs);
+          nodeOutputs.set(node.id, { stepByName: outputs.relativeByName, templateByName: outputs.absoluteByName });
+          const outputFiles = this.outputFilesForNode(node, outputs.relativeByName, item.itemId);
+          for (const file of outputFiles) file.size = (await fs.stat(fileStorageService.resolveRelativePath(file.relativePath))).size;
+          execution.outputs.push(...outputFiles);
+          await this.changeItem(execution, (current) => {
+            current.outputFiles = [...execution.outputs];
+            Object.assign(current.steps[index], { status: "success", finishedAt: new Date(), exitCode: 0 });
+          });
+        } finally { release(); }
       }
-    );
-
-    socketService.emitToRun(runId, "run:status", { runId, itemId: item.itemId, status: "running" });
-
-    void this.executeRerunItem({
-      runId,
-      userId,
-      workflowRunDir: run.workingDir ? fileStorageService.resolveRelativePath(run.workingDir) : path.dirname(item.dirs.runDir),
-      nodes: parsedGraph.nodes,
-      edges: parsedGraph.edges,
-      executionOrder,
-      item,
-      startIndex,
-      existingOutputFiles: existingItemOutputs,
-      params: (run.params || {}) as Record<string, string | number | boolean>
+      controller.signal.throwIfAborted();
+      await this.changeItem(execution, (current) => {
+        current.status = "success"; current.finishedAt = new Date(); delete current.waitReason; delete current.process; delete current.cancelRequestedAt;
+      });
+    } catch (error) {
+      const cancelled = controller.signal.aborted && !execution.failure;
+      const status = cancelled ? "cancelled" : "failed";
+      const message = (execution.failure || error) instanceof Error ? (execution.failure || error as Error).message : "Job failed";
+      await this.changeItem(execution, (current) => {
+        current.status = status; current.finishedAt = new Date(); current.errorMessage = message;
+        delete current.waitReason; delete current.process; delete current.cancelRequestedAt;
+        current.steps = current.steps.map((step, index) => !isActiveStatus(step.status) ? step : {
+          ...step, status: cancelled ? "cancelled" : index === activeIndex ? "failed" : "skipped", finishedAt: new Date(),
+          ...(index === activeIndex ? { errorMessage: message, exitCode: (error as { exitCode?: number }).exitCode } : {}) });
+      });
+    }
+  }
+  private async runNode(execution: Execution, index: number, inputs: ResolvedValues,
+    outputs: { relativeByName: Record<string, string>; absoluteByName: Record<string, string> }) {
+    const { item, controller, runId, userId, attemptId } = execution;
+    const node = execution.order[index];
+    const scope = { inputs: inputs.templateByName, outputs: outputs.absoluteByName,
+      params: { ...(node.defaultParams || {}), ...(await this.readRun(userId, runId)).params },
+      runDir: item.dirs.runDir, inputDir: item.dirs.inputDir, outputDir: item.dirs.outputDir, tempDir: item.dirs.tempDir };
+    const bin = this.resolveTemplate(node.toolConfig.bin, scope, node.label);
+    const args = node.toolConfig.args.map((arg) => this.resolveTemplate(arg, scope, node.label));
+    const env = Object.fromEntries(Object.entries(node.toolConfig.env || {}).map(([key, value]) => [key, this.resolveTemplate(value, scope, node.label)]));
+    const cwd = node.toolConfig.workingDir ? path.resolve(this.resolveTemplate(node.toolConfig.workingDir, scope, node.label)) : process.cwd();
+    const logsDir = path.join(item.dirs.runDir, "logs", attemptId);
+    await fs.mkdir(logsDir, { recursive: true });
+    const logPath = path.join(logsDir, `${sanitizeFileName(node.id)}.log`);
+    await this.changeItem(execution, (current) => {
+      current.status = "running"; current.startedAt ||= new Date(); delete current.waitReason;
+      Object.assign(current.steps[index], { status: "running", startedAt: new Date(), command: bin, args,
+        inputs: inputs.stepByName, outputs: outputs.relativeByName, logPath: fileStorageService.relativeFromAbsolute(logPath), attemptId });
     });
-
-    return RunModel.findOne({ _id: runId, userId }).lean();
+    controller.signal.throwIfAborted();
+    const log = createWriteStream(logPath, { flags: "a" });
+    const completion = finished(log);
+    completion.catch(() => undefined);
+    log.on("error", (error) => { execution.failure = error; controller.abort(error); });
+    const notify = () => socketService.notifyLog(runId, item.itemId, node.id, attemptId);
+    const write = (chunk: Buffer | string) => log.write(chunk, notify);
+    write(`[runner] cwd: ${cwd}\n[runner] command: ${JSON.stringify([bin, ...args])}\n`);
+    try {
+      await runSupervisedCommand({ bin, args, cwd, env, signal: controller.signal, timeoutSeconds: node.toolConfig.timeoutSeconds,
+        register: async (identity) => { await this.changeItem(execution, (current) => { current.process = identity; }); },
+        log: write, onDrain: (resume) => log.on("drain", resume) });
+      controller.signal.throwIfAborted();
+      for (const output of Object.values(outputs.absoluteByName)) {
+        const stat = await fs.stat(output).catch(() => undefined);
+        if (!stat?.isFile()) throw new Error(`Declared output file was not created: ${output}`);
+      }
+      write("[runner] command finished successfully\n");
+    } catch (error) {
+      write(`[runner] ${error instanceof Error ? error.message : "Command failed"}\n`);
+      throw error;
+    } finally { log.end(); await completion; notify(); }
+    await this.copyAutoDownloadFiles({ runId, userId, itemId: item.itemId, node, exportDir: item.exportDir,
+      resolvedInputs: inputs, resolvedOutputs: outputs, logPath });
+    controller.signal.throwIfAborted();
+    await this.changeItem(execution, (current) => { delete current.process; });
+  }
+  async recoverInterruptedRuns() {
+    const cursor = RunModel.find({ $or: [
+      { status: { $in: ["await", "pending", "running"] } }, { "items.status": { $in: ["await", "pending", "running"] } },
+      { "steps.status": "waiting" }, { "items.steps.status": "waiting" }, { "items.process": { $exists: true } }
+    ] }).lean().cursor();
+    let recovered = 0;
+    for await (const document of cursor) {
+      const run = document as unknown as StoredRun;
+      for (const item of run.items || []) if (item.process) await stopOwnedProcess(item.process);
+      const before = JSON.stringify(run);
+      recoverRun(run as unknown as Parameters<typeof recoverRun>[0]);
+      if (JSON.stringify(run) !== before) {
+        run.revision = (run.revision || 0) + 1;
+        await RunModel.updateOne({ _id: run._id }, { $set: { status: run.status, items: run.items, steps: run.steps,
+          revision: run.revision,
+          ...(run.finishedAt ? { finishedAt: run.finishedAt } : {}), ...(run.errorMessage ? { errorMessage: run.errorMessage } : {}) } });
+        if (run.workingDir) await fileStorageService.writeManifest(fileStorageService.resolveRelativePath(run.workingDir), run).catch(() => undefined);
+        recovered++;
+      }
+    }
+    return recovered;
+  }
+  async shutdown() {
+    this.shuttingDown = true;
+    const executions = [...this.executions.values()];
+    for (const execution of executions) execution.controller.abort(new Error("Backend stopped; rerun to continue"));
+    await Promise.all(executions.map((execution) => execution.done));
   }
 
   private async prepareRunItems(input: {
@@ -488,709 +553,6 @@ class WorkflowRunnerService {
     return allocated;
   }
 
-  private async executeRun(input: {
-    runId: string;
-    userId: string;
-    nodes: WorkflowNode[];
-    edges: WorkflowEdge[];
-    executionOrder: WorkflowNode[];
-    items: PreparedRunItem[];
-    dirs: RunDirs;
-    params: Record<string, string | number | boolean>;
-  }) {
-    this.startActiveExecution(input.runId);
-    const semaphores = new Map(
-      input.executionOrder.map((node) => [node.id, new Semaphore(Math.max(1, node.toolConfig.maxConcurrent || 1))])
-    );
-
-    try {
-      const results = await Promise.all(
-        input.items.map((item) =>
-          this.executeRunItem({
-            ...input,
-            item,
-            semaphores
-          })
-        )
-      );
-      const outputFiles = results.flatMap((result) => result.outputFiles);
-      const failedItems = results.filter((result) => result.status === "failed");
-      const cancelledItems = results.filter((result) => result.status === "cancelled");
-      const status = cancelledItems.length > 0 ? "cancelled" : failedItems.length > 0 ? "failed" : "success";
-      const errorMessage = failedItems.length > 0 ? `${failedItems.length} batch item(s) failed` : undefined;
-
-      await RunModel.updateOne(
-        { _id: input.runId, userId: input.userId },
-        { $set: { status, finishedAt: new Date(), outputFiles, ...(errorMessage ? { errorMessage } : {}) } }
-      );
-      await this.writeManifest(input.runId, input.dirs.runDir);
-      if (status !== "success") {
-        socketService.emitToRun(input.runId, "run:error", {
-          runId: input.runId,
-          status,
-          message: errorMessage
-        });
-      }
-      socketService.emitToRun(input.runId, "run:finished", { runId: input.runId, status });
-    } catch (error) {
-      const status = error instanceof CancelledRunError ? "cancelled" : "failed";
-      await RunModel.updateOne(
-        { _id: input.runId, userId: input.userId },
-        {
-          $set: {
-            status,
-            finishedAt: new Date(),
-            errorMessage: error instanceof Error ? error.message : "Workflow run failed"
-          }
-        }
-      );
-      await this.writeManifest(input.runId, input.dirs.runDir).catch(() => undefined);
-      socketService.emitToRun(input.runId, "run:error", {
-        runId: input.runId,
-        status,
-        message: error instanceof Error ? error.message : "Workflow run failed"
-      });
-      socketService.emitToRun(input.runId, "run:finished", { runId: input.runId, status });
-    } finally {
-      this.finishActiveExecution(input.runId);
-      this.cleanupRunTrackingIfIdle(input.runId);
-    }
-  }
-
-  private async executeRerunItem(input: {
-    runId: string;
-    userId: string;
-    workflowRunDir: string;
-    nodes: WorkflowNode[];
-    edges: WorkflowEdge[];
-    executionOrder: WorkflowNode[];
-    item: PreparedRunItem;
-    startIndex: number;
-    existingOutputFiles: StoredFile[];
-    params: Record<string, string | number | boolean>;
-  }) {
-    this.startActiveExecution(input.runId);
-    const semaphores = new Map(
-      input.executionOrder.map((node) => [node.id, new Semaphore(Math.max(1, node.toolConfig.maxConcurrent || 1))])
-    );
-
-    try {
-      const initialNodeOutputs = this.reconstructNodeOutputs(input.executionOrder, input.item, input.startIndex);
-      await this.executeRunItem({
-        runId: input.runId,
-        userId: input.userId,
-        nodes: input.nodes,
-        edges: input.edges,
-        executionOrder: input.executionOrder,
-        item: input.item,
-        dirs: {
-          runDir: input.workflowRunDir,
-          inputDir: path.join(input.workflowRunDir, "input"),
-          outputDir: path.join(input.workflowRunDir, "output"),
-          tempDir: path.join(input.workflowRunDir, "temp"),
-          logsDir: path.join(input.workflowRunDir, "logs")
-        },
-        semaphores,
-        params: input.params,
-        startIndex: input.startIndex,
-        initialNodeOutputs,
-        existingOutputFiles: input.existingOutputFiles
-      });
-      await this.finalizeRunAfterRerun(input.runId, input.userId, input.workflowRunDir);
-    } catch (error) {
-      await this.updateItem(input.runId, input.userId, input.item.index, {
-        status: error instanceof CancelledRunError ? "cancelled" : "failed",
-        finishedAt: new Date(),
-        errorMessage: error instanceof Error ? error.message : "Rerun failed"
-      });
-      await this.finalizeRunAfterRerun(input.runId, input.userId, input.workflowRunDir);
-    } finally {
-      this.finishActiveExecution(input.runId);
-      this.cleanupRunTrackingIfIdle(input.runId);
-    }
-  }
-
-  private stepsForRerun(executionOrder: WorkflowNode[], currentSteps: RunStep[], startIndex: number) {
-    return executionOrder.map((node, index): RunStep => {
-      const currentStep = currentSteps[index];
-      if (index < startIndex && currentStep) {
-        return currentStep;
-      }
-      return {
-        nodeId: node.id,
-        label: node.label,
-        status: "waiting"
-      };
-    });
-  }
-
-  private reconstructNodeOutputs(executionOrder: WorkflowNode[], item: PreparedRunItem, startIndex: number) {
-    const nodeOutputs = new Map<string, NodeOutputValues>();
-    const initialFiles = new Map(item.inputFiles.map((file) => [file.name, file.relativePath]));
-    const initialTexts = new Map(item.inputValues.map((value) => [value.name, value.value]));
-
-    for (let index = 0; index < startIndex; index += 1) {
-      const node = executionOrder[index];
-      if (node.type === "fileInput") {
-        nodeOutputs.set(node.id, this.resolveInputNode(node, initialFiles, initialTexts));
-        continue;
-      }
-
-      const outputs = this.buildNodeOutputs(node, item.dirs.outputDir);
-      nodeOutputs.set(node.id, {
-        stepByName: outputs.relativeByName,
-        templateByName: outputs.absoluteByName
-      });
-    }
-
-    return nodeOutputs;
-  }
-
-  private async finalizeRunAfterRerun(runId: string, userId: string, workflowRunDir: string) {
-    const run = await RunModel.findOne({ _id: runId, userId }).lean();
-    if (!run) {
-      return;
-    }
-
-    const items = run.items || [];
-    const outputFiles = items.flatMap((item) => item.outputFiles || []);
-    const status = items.some((item) => item.status === "running" || item.status === "pending")
-      ? "running"
-      : items.some((item) => item.status === "cancelled")
-        ? "cancelled"
-        : items.some((item) => item.status === "failed")
-          ? "failed"
-          : "success";
-    const finished = status !== "running";
-    const errorMessage = status === "failed" ? `${items.filter((item) => item.status === "failed").length} batch item(s) failed` : undefined;
-
-    await RunModel.updateOne(
-      { _id: runId, userId },
-      {
-        $set: {
-          status,
-          outputFiles,
-          ...(finished ? { finishedAt: new Date() } : {}),
-          ...(errorMessage ? { errorMessage } : {})
-        },
-        ...(errorMessage ? {} : { $unset: { errorMessage: "" } })
-      }
-    );
-    await this.writeManifest(runId, workflowRunDir).catch(() => undefined);
-    if (finished) {
-      if (status !== "success") {
-        socketService.emitToRun(runId, "run:error", { runId, status, message: errorMessage });
-      }
-      socketService.emitToRun(runId, "run:finished", { runId, status });
-    } else {
-      socketService.emitToRun(runId, "run:status", { runId, status });
-    }
-  }
-
-  private async executeRunItem(input: {
-    runId: string;
-    userId: string;
-    nodes: WorkflowNode[];
-    edges: WorkflowEdge[];
-    executionOrder: WorkflowNode[];
-    item: PreparedRunItem;
-    dirs: RunDirs;
-    semaphores: Map<string, Semaphore>;
-    params: Record<string, string | number | boolean>;
-    startIndex?: number;
-    initialNodeOutputs?: Map<string, NodeOutputValues>;
-    existingOutputFiles?: StoredFile[];
-  }): Promise<{ status: "success" | "failed" | "cancelled"; outputFiles: StoredFile[] }> {
-    const startIndex = input.startIndex || 0;
-    const nodeOutputs = new Map<string, NodeOutputValues>(input.initialNodeOutputs || []);
-    const initialFiles = new Map(input.item.inputFiles.map((file) => [file.name, file.relativePath]));
-    const initialTexts = new Map(input.item.inputValues.map((value) => [value.name, value.value]));
-    const runOutputFiles: StoredFile[] = [...(input.existingOutputFiles || [])];
-
-    await this.updateItem(input.runId, input.userId, input.item.index, {
-      status: "running",
-      startedAt: new Date()
-    });
-
-    try {
-      for (let orderIndex = startIndex; orderIndex < input.executionOrder.length; orderIndex += 1) {
-        const node = input.executionOrder[orderIndex];
-        await this.throwIfCancelled(input.runId);
-        const stepIndex = orderIndex;
-
-        if (node.type === "fileInput") {
-          const fileInputOutputs = this.resolveInputNode(node, initialFiles, initialTexts);
-          await this.copyAutoDownloadFiles({
-            runId: input.runId,
-            userId: input.userId,
-            itemId: input.item.itemId,
-            node,
-            exportDir: input.item.exportDir,
-            resolvedInputs: { stepByName: {}, templateByName: {} },
-            resolvedOutputs: {
-              relativeByName: fileInputOutputs.stepByName,
-              absoluteByName: fileInputOutputs.templateByName
-            }
-          });
-          await this.updateItemStep(input.runId, input.userId, input.item.index, stepIndex, {
-            status: "success",
-            startedAt: new Date(),
-            finishedAt: new Date(),
-            outputs: fileInputOutputs.stepByName
-          });
-          await this.syncAggregateStep(input.runId, input.userId, stepIndex);
-          nodeOutputs.set(node.id, fileInputOutputs);
-          socketService.emitToRun(input.runId, "step:status", {
-            runId: input.runId,
-            itemId: input.item.itemId,
-            nodeId: node.id,
-            status: "success"
-          });
-          continue;
-        }
-
-        const resolvedInputs = this.resolveNodeInputs(node, input.edges, nodeOutputs, initialFiles, initialTexts);
-        const resolvedOutputs = this.buildNodeOutputs(node, input.item.dirs.outputDir);
-        const semaphore = input.semaphores.get(node.id);
-        await semaphore?.acquire();
-        try {
-          await this.throwIfCancelled(input.runId);
-          await this.runNode({
-            runId: input.runId,
-            userId: input.userId,
-            itemId: input.item.itemId,
-            itemIndex: input.item.index,
-            node,
-            stepIndex,
-            dirs: input.item.dirs,
-            exportDir: input.item.exportDir,
-            resolvedInputs,
-            resolvedOutputs,
-            params: { ...(node.defaultParams || {}), ...input.params }
-          });
-        } finally {
-          semaphore?.release();
-        }
-
-        nodeOutputs.set(node.id, {
-          stepByName: resolvedOutputs.relativeByName,
-          templateByName: resolvedOutputs.absoluteByName
-        });
-        const outputFiles = this.outputFilesForNode(node, resolvedOutputs.relativeByName, input.item.itemId);
-        const newOutputFiles = outputFiles.filter((file) => {
-          const isDuplicate = runOutputFiles.some(
-            (existingFile) => existingFile.itemId === file.itemId && existingFile.relativePath === file.relativePath
-          );
-          return !isDuplicate;
-        });
-        runOutputFiles.push(...newOutputFiles);
-
-        const update: Record<string, unknown> = { $set: { [`items.${input.item.index}.outputFiles`]: runOutputFiles } };
-        if (newOutputFiles.length > 0) {
-          update.$push = { outputFiles: { $each: newOutputFiles } };
-        }
-        await RunModel.updateOne({ _id: input.runId, userId: input.userId, [`items.${input.item.index}`]: { $exists: true } }, update);
-        for (const file of outputFiles) {
-          socketService.emitToRun(input.runId, "step:output", { runId: input.runId, itemId: input.item.itemId, nodeId: node.id, file });
-        }
-      }
-
-      await this.updateItem(input.runId, input.userId, input.item.index, {
-        status: "success",
-        finishedAt: new Date(),
-        outputFiles: runOutputFiles
-      });
-      return { status: "success", outputFiles: runOutputFiles };
-    } catch (error) {
-      const status = error instanceof CancelledRunError ? "cancelled" : "failed";
-      const message = error instanceof Error ? error.message : "Batch item failed";
-      await this.updateItem(input.runId, input.userId, input.item.index, {
-        status,
-        finishedAt: new Date(),
-        errorMessage: message,
-        outputFiles: runOutputFiles
-      });
-      socketService.emitToRun(input.runId, "run:status", {
-        runId: input.runId,
-        itemId: input.item.itemId,
-        status,
-        errorMessage: message
-      });
-      return { status, outputFiles: runOutputFiles };
-    }
-  }
-
-  private async runNode(input: {
-    runId: string;
-    userId: string;
-    itemId: string;
-    itemIndex: number;
-    node: WorkflowNode;
-    stepIndex: number;
-    dirs: RunDirs;
-    exportDir?: string;
-    resolvedInputs: ResolvedValues;
-    resolvedOutputs: {
-      absoluteByName: Record<string, string>;
-      relativeByName: Record<string, string>;
-    };
-    params: Record<string, string | number | boolean>;
-  }) {
-    const logFileName = `${sanitizeFileName(input.node.id || input.node.label)}.log`;
-    const logPath = path.join(input.dirs.logsDir, logFileName);
-    const relativeLogPath = fileStorageService.relativeFromAbsolute(logPath);
-    const templateScope = {
-      inputs: input.resolvedInputs.templateByName,
-      outputs: input.resolvedOutputs.absoluteByName,
-      params: input.params,
-      runDir: input.dirs.runDir,
-      inputDir: input.dirs.inputDir,
-      outputDir: input.dirs.outputDir,
-      tempDir: input.dirs.tempDir
-    };
-
-    await this.updateItemStep(input.runId, input.userId, input.itemIndex, input.stepIndex, {
-      status: "running",
-      startedAt: new Date(),
-      inputs: input.resolvedInputs.stepByName,
-      outputs: input.resolvedOutputs.relativeByName,
-      logPath: relativeLogPath
-    });
-    await this.syncAggregateStep(input.runId, input.userId, input.stepIndex);
-    socketService.emitToRun(input.runId, "step:status", {
-      runId: input.runId,
-      itemId: input.itemId,
-      nodeId: input.node.id,
-      status: "running"
-    });
-
-    try {
-      const bin = this.resolveTemplate(input.node.toolConfig.bin, templateScope, `node "${input.node.label}" command`);
-      const args = (input.node.toolConfig.args || []).map((arg) =>
-        this.resolveTemplate(arg, templateScope, `node "${input.node.label}" argument "${arg}"`)
-      );
-      const commandEnv = Object.fromEntries(
-        Object.entries(input.node.toolConfig.env || {}).map(([key, value]) => [
-          key,
-          this.resolveTemplate(String(value), templateScope, `node "${input.node.label}" env "${key}"`)
-        ])
-      );
-      const cwdTemplate = input.node.toolConfig.workingDir
-        ? this.resolveTemplate(input.node.toolConfig.workingDir, templateScope, `node "${input.node.label}" working directory`)
-        : process.cwd();
-      const cwd = path.isAbsolute(cwdTemplate) ? cwdTemplate : path.resolve(process.cwd(), cwdTemplate);
-
-      await this.updateItemStep(input.runId, input.userId, input.itemIndex, input.stepIndex, {
-        command: bin,
-        args
-      });
-      await this.syncAggregateStep(input.runId, input.userId, input.stepIndex);
-      socketService.emitToRun(input.runId, "step:status", {
-        runId: input.runId,
-        itemId: input.itemId,
-        nodeId: input.node.id,
-        status: "running",
-        command: bin,
-        args
-      });
-
-      await this.spawnAndStream({
-        runId: input.runId,
-        itemId: input.itemId,
-        nodeId: input.node.id,
-        bin,
-        args,
-        cwd,
-        env: commandEnv,
-        timeoutSeconds: input.node.toolConfig.timeoutSeconds,
-        logPath
-      });
-
-      await Promise.all(
-        Object.values(input.resolvedOutputs.absoluteByName).map(async (absolutePath) => {
-          try {
-            await fs.access(absolutePath, fsSync.constants.F_OK);
-          } catch {
-            throw new Error(`Declared output file was not created: ${absolutePath}`);
-          }
-        })
-      );
-
-      await this.copyAutoDownloadFiles({
-        runId: input.runId,
-        userId: input.userId,
-        itemId: input.itemId,
-        node: input.node,
-        exportDir: input.exportDir,
-        resolvedInputs: input.resolvedInputs,
-        resolvedOutputs: input.resolvedOutputs,
-        logPath
-      });
-
-      await this.updateItemStep(input.runId, input.userId, input.itemIndex, input.stepIndex, {
-        status: "success",
-        finishedAt: new Date(),
-        exitCode: 0
-      });
-      await this.syncAggregateStep(input.runId, input.userId, input.stepIndex);
-      socketService.emitToRun(input.runId, "step:status", {
-        runId: input.runId,
-        itemId: input.itemId,
-        nodeId: input.node.id,
-        status: "success"
-      });
-    } catch (error) {
-      const status = error instanceof CancelledRunError ? "cancelled" : "failed";
-      const exitCode = error instanceof CommandFailedError ? error.exitCode : undefined;
-      const message = `[runner] step failed: ${error instanceof Error ? error.message : "Step failed"}\n`;
-      await fs.appendFile(logPath, message).catch(() => undefined);
-      socketService.emitToRun(input.runId, "step:log", {
-        runId: input.runId,
-        itemId: input.itemId,
-        nodeId: input.node.id,
-        stream: "stderr",
-        message,
-        timestamp: new Date().toISOString()
-      });
-      await this.updateItemStep(input.runId, input.userId, input.itemIndex, input.stepIndex, {
-        status,
-        finishedAt: new Date(),
-        exitCode,
-        errorMessage: error instanceof Error ? error.message : "Step failed"
-      });
-      await this.syncAggregateStep(input.runId, input.userId, input.stepIndex);
-      socketService.emitToRun(input.runId, "step:status", {
-        runId: input.runId,
-        itemId: input.itemId,
-        nodeId: input.node.id,
-        status,
-        errorMessage: error instanceof Error ? error.message : "Step failed"
-      });
-      throw error;
-    }
-  }
-
-  private spawnAndStream(input: {
-    runId: string;
-    itemId: string;
-    nodeId: string;
-    bin: string;
-    args: string[];
-    cwd: string;
-    env: Record<string, string>;
-    timeoutSeconds?: number;
-    logPath: string;
-  }) {
-    return new Promise<void>((resolve, reject) => {
-      const logStream = createWriteStream(input.logPath, { flags: "a" });
-      let settled = false;
-      let timeout: NodeJS.Timeout | undefined;
-
-      const emitRunnerLog = (stream: "stdout" | "stderr", message: string) => {
-        logStream.write(message);
-        socketService.emitToRun(input.runId, "step:log", {
-          runId: input.runId,
-          itemId: input.itemId,
-          nodeId: input.nodeId,
-          stream,
-          message,
-          timestamp: new Date().toISOString()
-        });
-      };
-
-      emitRunnerLog("stdout", `[runner] cwd: ${input.cwd}\n`);
-      emitRunnerLog("stdout", `[runner] command: ${JSON.stringify([input.bin, ...input.args])}\n`);
-
-      if (this.cancelledRuns.has(input.runId)) {
-        emitRunnerLog("stderr", "[runner] command cancelled before start\n");
-        logStream.end();
-        reject(new CancelledRunError());
-        return;
-      }
-
-      let child: ChildProcessWithoutNullStreams;
-      try {
-        child = spawn(input.bin, input.args, {
-          cwd: input.cwd,
-          detached: process.platform !== "win32",
-          shell: false,
-          env: {
-            ...process.env,
-            ...input.env
-          }
-        });
-      } catch (error) {
-        const message = `[runner] spawn error: ${error instanceof Error ? error.message : "Unable to start command"}\n`;
-        emitRunnerLog("stderr", message);
-        logStream.end();
-        reject(error);
-        return;
-      }
-
-      const activeChildren = this.activeChildren.get(input.runId) || new Set<ChildProcessWithoutNullStreams>();
-      activeChildren.add(child);
-      this.activeChildren.set(input.runId, activeChildren);
-
-      const onChunk = (stream: "stdout" | "stderr", chunk: Buffer) => {
-        if (settled) {
-          return;
-        }
-        emitRunnerLog(stream, chunk.toString());
-      };
-
-      child.stdout.on("data", (chunk: Buffer) => onChunk("stdout", chunk));
-      child.stderr.on("data", (chunk: Buffer) => onChunk("stderr", chunk));
-
-      child.on("error", (error) => {
-        this.activeChildren.get(input.runId)?.delete(child);
-        if (settled) return;
-        settled = true;
-        if (timeout) clearTimeout(timeout);
-        emitRunnerLog("stderr", `[runner] spawn error: ${error.message}\n`);
-        logStream.end();
-        reject(error);
-      });
-
-      child.on("close", (exitCode) => {
-        if (timeout) clearTimeout(timeout);
-        this.activeChildren.get(input.runId)?.delete(child);
-        if (settled) return;
-        settled = true;
-
-        if (this.cancelledRuns.has(input.runId)) {
-          emitRunnerLog("stderr", "[runner] command cancelled\n");
-          logStream.end();
-          reject(new CancelledRunError());
-          return;
-        }
-
-        if (exitCode === 0) {
-          emitRunnerLog("stdout", "[runner] command finished successfully\n");
-          logStream.end();
-          resolve();
-          return;
-        }
-        emitRunnerLog("stderr", `[runner] command exited with code ${exitCode ?? "unknown"}\n`);
-        logStream.end();
-        reject(new CommandFailedError(`Command exited with code ${exitCode ?? "unknown"}`, exitCode));
-      });
-
-      if (input.timeoutSeconds) {
-        timeout = setTimeout(() => {
-          if (settled) return;
-          settled = true;
-          this.signalChildProcess(child, "SIGTERM");
-          const forceKillTimer = setTimeout(() => this.signalChildProcess(child, "SIGKILL"), 2500);
-          forceKillTimer.unref();
-          emitRunnerLog("stderr", `[runner] command timed out after ${input.timeoutSeconds} seconds\n`);
-          logStream.end();
-          reject(new Error(`Command timed out after ${input.timeoutSeconds} seconds`));
-        }, input.timeoutSeconds * 1000);
-      }
-    });
-  }
-
-  private requestStopActiveChildren(runId: string) {
-    for (const child of this.activeChildren.get(runId) || []) {
-      if (child.exitCode !== null || child.signalCode !== null) {
-        continue;
-      }
-
-      this.signalChildProcess(child, "SIGTERM");
-
-      const forceKillTimer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) {
-          this.signalChildProcess(child, "SIGKILL");
-        }
-      }, 2500);
-      forceKillTimer.unref();
-    }
-  }
-
-  private signalChildProcess(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals) {
-    if (child.exitCode !== null || child.signalCode !== null) {
-      return;
-    }
-
-    if (process.platform !== "win32" && child.pid) {
-      const descendantPids = this.descendantPids(child.pid);
-      try {
-        process.kill(-child.pid, signal);
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== "ESRCH") {
-          // Fall back to direct PID signalling below.
-        }
-      }
-
-      for (const pid of descendantPids) {
-        try {
-          process.kill(pid, signal);
-        } catch {
-          // The process may already be gone after the process-group signal.
-        }
-      }
-    }
-
-    if (!child.killed || signal === "SIGKILL") {
-      child.kill(signal);
-    }
-  }
-
-  private descendantPids(pid: number): number[] {
-    if (process.platform !== "linux") {
-      return [];
-    }
-
-    try {
-      const children = fsSync
-        .readFileSync(`/proc/${pid}/task/${pid}/children`, "utf8")
-        .trim()
-        .split(/\s+/)
-        .filter(Boolean)
-        .map((value) => Number(value))
-        .filter((value) => Number.isInteger(value) && value > 0);
-      return children.flatMap((childPid) => [...this.descendantPids(childPid), childPid]);
-    } catch {
-      return [];
-    }
-  }
-
-  private async waitForRunIdle(runId: string, timeoutMs: number) {
-    const deadline = Date.now() + timeoutMs;
-    while (this.hasActiveRunProcesses(runId)) {
-      if (Date.now() >= deadline) {
-        return false;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    return true;
-  }
-
-  private startActiveExecution(runId: string) {
-    this.activeExecutionCounts.set(runId, (this.activeExecutionCounts.get(runId) || 0) + 1);
-  }
-
-  private finishActiveExecution(runId: string) {
-    const nextCount = (this.activeExecutionCounts.get(runId) || 0) - 1;
-    if (nextCount > 0) {
-      this.activeExecutionCounts.set(runId, nextCount);
-      return;
-    }
-    this.activeExecutionCounts.delete(runId);
-  }
-
-  private hasActiveRunProcesses(runId: string) {
-    return (this.activeExecutionCounts.get(runId) || 0) > 0 || (this.activeChildren.get(runId)?.size || 0) > 0;
-  }
-
-  private cleanupRunTrackingIfIdle(runId: string) {
-    if (this.hasActiveRunProcesses(runId)) {
-      return;
-    }
-    this.activeChildren.delete(runId);
-    this.cancelledRuns.delete(runId);
-  }
 
   private resolveNodeInputs(
     node: WorkflowNode,
@@ -1386,14 +748,8 @@ class WorkflowRunnerService {
     if (input.logPath) {
       await fs.appendFile(input.logPath, input.message).catch(() => undefined);
     }
-    socketService.emitToRun(input.runId, "step:log", {
-      runId: input.runId,
-      itemId: input.itemId,
-      nodeId: input.nodeId,
-      stream: input.stream,
-      message: input.message,
-      timestamp: new Date().toISOString()
-    });
+    const attemptId = this.executions.get(this.key(input.runId, input.itemId))?.attemptId;
+    if (attemptId) socketService.notifyLog(input.runId, input.itemId, input.nodeId, attemptId);
   }
 
   private resolveTemplate(value: string, scope: Record<string, unknown>, context: string) {
@@ -1478,135 +834,7 @@ class WorkflowRunnerService {
     };
   }
 
-  private normalizeRunStep(value: unknown): RunStep {
-    const step = (value || {}) as Partial<RunStep>;
-    return {
-      nodeId: String(step.nodeId || ""),
-      label: String(step.label || step.nodeId || "Step"),
-      status: step.status || "waiting",
-      startedAt: step.startedAt || undefined,
-      finishedAt: step.finishedAt || undefined,
-      exitCode: step.exitCode ?? undefined,
-      command: step.command || undefined,
-      args: step.args || undefined,
-      inputs: step.inputs || undefined,
-      outputs: step.outputs || undefined,
-      logPath: step.logPath || undefined,
-      errorMessage: step.errorMessage || undefined
-    };
-  }
 
-  private async updateStep(runId: string, userId: string, stepIndex: number, partial: Partial<RunStep>) {
-    const updates: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(partial)) {
-      if (value !== undefined) {
-        updates[`steps.${stepIndex}.${key}`] = value;
-      }
-    }
-
-    if (Object.keys(updates).length === 0) {
-      return;
-    }
-
-    const result = await RunModel.updateOne(
-      { _id: runId, userId, [`steps.${stepIndex}`]: { $exists: true } },
-      { $set: updates }
-    );
-
-    if (result.matchedCount === 0) {
-      throw new HttpError(404, "Run not found");
-    }
-  }
-
-  private async updateItem(
-    runId: string,
-    userId: string,
-    itemIndex: number,
-    partial: Partial<Omit<RunItem, "steps" | "itemId" | "index" | "label">>
-  ) {
-    const updates: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(partial)) {
-      if (value !== undefined) {
-        updates[`items.${itemIndex}.${key}`] = value;
-      }
-    }
-    if (Object.keys(updates).length === 0) {
-      return;
-    }
-    await RunModel.updateOne(
-      { _id: runId, userId, [`items.${itemIndex}`]: { $exists: true } },
-      { $set: updates }
-    );
-  }
-
-  private async updateItemStep(runId: string, userId: string, itemIndex: number, stepIndex: number, partial: Partial<RunStep>) {
-    const updates: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(partial)) {
-      if (value !== undefined) {
-        updates[`items.${itemIndex}.steps.${stepIndex}.${key}`] = value;
-      }
-    }
-    if (Object.keys(updates).length === 0) {
-      return;
-    }
-    await RunModel.updateOne(
-      { _id: runId, userId, [`items.${itemIndex}.steps.${stepIndex}`]: { $exists: true } },
-      { $set: updates }
-    );
-  }
-
-  private async syncAggregateStep(runId: string, userId: string, stepIndex: number) {
-    const run = await RunModel.findOne({ _id: runId, userId }).select("items steps").lean();
-    if (!run?.items?.length) {
-      return;
-    }
-
-    const itemSteps = run.items.map((item) => item.steps?.[stepIndex]).filter(Boolean);
-    if (itemSteps.length === 0) {
-      return;
-    }
-
-    const status = itemSteps.some((step) => step.status === "failed")
-      ? "failed"
-      : itemSteps.some((step) => step.status === "cancelled")
-        ? "cancelled"
-        : itemSteps.some((step) => step.status === "running")
-          ? "running"
-          : itemSteps.every((step) => step.status === "success")
-            ? "success"
-            : "waiting";
-    const sample = itemSteps.find((step) => step.status === "running") || itemSteps.find((step) => step.status === "failed") || itemSteps[0];
-
-    await this.updateStep(runId, userId, stepIndex, {
-      status,
-      startedAt: sample.startedAt || undefined,
-      finishedAt: status === "success" || status === "failed" || status === "cancelled" ? sample.finishedAt || undefined : undefined,
-      exitCode: sample.exitCode ?? undefined,
-      command: sample.command || undefined,
-      args: sample.args,
-      inputs: sample.inputs,
-      outputs: sample.outputs,
-      logPath: sample.logPath || undefined,
-      errorMessage: sample.errorMessage || undefined
-    });
-  }
-
-  private async throwIfCancelled(runId: string) {
-    if (this.cancelledRuns.has(runId)) {
-      throw new CancelledRunError();
-    }
-    const run = await RunModel.findById(runId).select("status").lean();
-    if (run?.status === "cancelled") {
-      throw new CancelledRunError();
-    }
-  }
-
-  private async writeManifest(runId: string, runDir: string) {
-    const run = await RunModel.findById(runId).lean();
-    if (run) {
-      await fileStorageService.writeManifest(runDir, run);
-    }
-  }
 }
 
 export const workflowRunnerService = new WorkflowRunnerService();

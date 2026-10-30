@@ -16,11 +16,12 @@ const fileSchema = new Schema(
 const runStepSchema = new Schema(
   {
     nodeId: { type: String, required: true },
+    attemptId: { type: String },
     label: { type: String, required: true },
     status: {
       type: String,
-      enum: ["waiting", "running", "success", "failed", "skipped", "cancelled"],
-      default: "waiting"
+      enum: ["await", "running", "success", "failed", "skipped", "cancelled"],
+      default: "await"
     },
     startedAt: { type: Date },
     finishedAt: { type: Date },
@@ -47,12 +48,16 @@ const inputValueSchema = new Schema(
 const runItemSchema = new Schema(
   {
     itemId: { type: String, required: true },
+    attemptId: { type: String },
+    waitReason: { type: String },
+    cancelRequestedAt: { type: Date },
+    process: { type: Schema.Types.Mixed },
     index: { type: Number, required: true },
     label: { type: String, required: true },
     status: {
       type: String,
-      enum: ["pending", "running", "success", "failed", "cancelled"],
-      default: "pending"
+      enum: ["await", "running", "success", "failed", "cancelled"],
+      default: "await"
     },
     startedAt: { type: Date },
     finishedAt: { type: Date },
@@ -74,8 +79,8 @@ const runSchema = new Schema(
     workflowId: { type: Schema.Types.ObjectId, ref: "Workflow", required: true, index: true },
     status: {
       type: String,
-      enum: ["pending", "running", "success", "failed", "cancelled"],
-      default: "pending",
+      enum: ["await", "running", "success", "failed", "cancelled"],
+      default: "await",
       index: true
     },
     startedAt: { type: Date },
@@ -86,6 +91,8 @@ const runSchema = new Schema(
     steps: [runStepSchema],
     items: [runItemSchema],
     params: { type: Schema.Types.Mixed, default: {} },
+    workflowSnapshot: { type: Schema.Types.Mixed },
+    revision: { type: Number, default: 0 },
     errorMessage: { type: String }
   },
   { timestamps: true }

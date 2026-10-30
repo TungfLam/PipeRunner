@@ -1,505 +1,172 @@
-import CancelIcon from "@mui/icons-material/Cancel";
-import RefreshIcon from "@mui/icons-material/Refresh";
-import RestartAltIcon from "@mui/icons-material/RestartAlt";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link as RouterLink, useParams } from "react-router-dom";
 import Alert from "@mui/material/Alert";
-import { useTheme } from "@mui/material/styles";
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
 import Chip from "@mui/material/Chip";
-import Divider from "@mui/material/Divider";
+import CircularProgress from "@mui/material/CircularProgress";
+import LinearProgress from "@mui/material/LinearProgress";
 import Paper from "@mui/material/Paper";
 import Stack from "@mui/material/Stack";
-import Table from "@mui/material/Table";
-import TableBody from "@mui/material/TableBody";
-import TableCell from "@mui/material/TableCell";
-import TableHead from "@mui/material/TableHead";
-import TableRow from "@mui/material/TableRow";
-import Tooltip from "@mui/material/Tooltip";
+import Tab from "@mui/material/Tab";
+import Tabs from "@mui/material/Tabs";
 import Typography from "@mui/material/Typography";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Background, Controls, MiniMap, ReactFlow, type Edge, type Node } from "@xyflow/react";
-import { useEffect, useMemo, useState } from "react";
-import { Link as RouterLink, useParams } from "react-router-dom";
-import { io } from "socket.io-client";
-import { API_URL, api } from "../api/client";
-import { FilePreview } from "../components/FilePreview";
-import { NodeConfigPanel } from "../components/NodeConfigPanel";
-import { ToolNode, type ToolNodeData } from "../components/ToolNode";
+import RefreshIcon from "@mui/icons-material/Refresh";
+import RestartAltIcon from "@mui/icons-material/RestartAlt";
+import StopCircleOutlinedIcon from "@mui/icons-material/StopCircleOutlined";
+import ArrowBackIcon from "@mui/icons-material/ArrowBack";
+import { api } from "../api/client";
+import { ConfirmDialog } from "../components/ConfirmDialog";
+import RunJobs from "../components/RunJobs";
+import RunLogs from "../components/RunLogs";
+import { useRunLive } from "../hooks/useRunLive";
 import { useAuthStore } from "../stores/authStore";
-import type { RunStep, Workflow, WorkflowRun } from "../types/domain";
+import type { Workflow, WorkflowRun } from "../types/domain";
 import { statusColor } from "../utils/status";
-import { repairWorkflowGraphHandles } from "../utils/workflowHandles";
 
-interface LogResponse {
-  logs: Array<{ itemId?: string; itemLabel?: string; nodeId: string; label: string; logPath?: string; log: string }>;
-}
+const RunGraph = lazy(() => import("../components/RunGraph"));
+const RunFiles = lazy(() => import("../components/RunFiles"));
+const active = (status: string) => ["await", "running"].includes(status);
+const rerunnable = (status: string) => ["failed", "cancelled"].includes(status);
+interface ActionResult { run: WorkflowRun; acceptedItemIds: string[]; skipped: Array<{ itemId: string; reason: string }> }
 
-const COMMAND_PREVIEW_LENGTH = 72;
-
-function commandTextForStep(step: RunStep) {
-  return [step.command, ...(step.args || [])].filter(Boolean).join(" ");
-}
-
-function commandPreview(commandText: string) {
-  if (commandText.length <= COMMAND_PREVIEW_LENGTH) {
-    return commandText;
-  }
-  return `${commandText.slice(0, COMMAND_PREVIEW_LENGTH - 4)}....`;
-}
-
-function CommandPreview({ step }: { step: RunStep }) {
-  const commandText = commandTextForStep(step);
-  const preview = commandPreview(commandText);
-  const isTruncated = preview !== commandText;
-
-  if (!commandText) {
-    return <Typography variant="caption" color="text.secondary">-</Typography>;
-  }
-
-  return (
-    <Tooltip
-      arrow
-      placement="top-start"
-      disableHoverListener={!isTruncated}
-      title={
-        <Typography variant="caption" sx={{ fontFamily: "monospace", whiteSpace: "normal", wordBreak: "break-all" }}>
-          {commandText}
-        </Typography>
-      }
-      componentsProps={{ tooltip: { sx: { maxWidth: 900 } } }}
-    >
-      <Typography
-        variant="caption"
-        sx={{ display: "block", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-      >
-        {preview}
-      </Typography>
-    </Tooltip>
-  );
+function duration(start?: string, finish?: string) {
+  if (!start) return "—";
+  if (!finish) return "In progress";
+  const seconds = Math.max(0, Math.round((Date.parse(finish) - Date.parse(start)) / 1000));
+  return seconds >= 60 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${seconds}s`;
 }
 
 export function RunPage() {
-  const theme = useTheme();
   const { runId = "" } = useParams();
   const token = useAuthStore((state) => state.token);
-  const queryClient = useQueryClient();
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
-  const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
-  const [liveLogs, setLiveLogs] = useState<Record<string, string>>({});
-  const nodeTypes = useMemo(() => ({ tool: ToolNode }), []);
-
-  const runQuery = useQuery({
-    queryKey: ["run", runId],
-    refetchInterval: (query) => {
-      const status = query.state.data?.status;
-      return status === "running" || status === "pending" ? 2500 : false;
-    },
-    queryFn: async () => (await api.get<{ run: WorkflowRun }>(`/runs/${runId}`)).data.run
-  });
-
+  const client = useQueryClient();
+  const { query, socket, connected } = useRunLive(runId, token);
+  const run = query.data;
+  const [selectedId, setSelectedId] = useState<string>();
+  const [nodeId, setNodeId] = useState<string>();
+  const [checkedIds, setCheckedIds] = useState<string[]>([]);
+  const [tab, setTab] = useState(0);
+  const [confirmCancel, setConfirmCancel] = useState(false);
+  const [notice, setNotice] = useState<{ warning: boolean; text: string }>();
+  const checked = useMemo(() => new Set(checkedIds), [checkedIds]);
   const workflowQuery = useQuery({
-    queryKey: ["workflow", runQuery.data?.workflowId],
-    enabled: Boolean(runQuery.data?.workflowId),
-    queryFn: async () =>
-      (await api.get<{ workflow: Workflow }>(`/workflows/${runQuery.data?.workflowId}`)).data.workflow
+    queryKey: ["workflow", run?.workflowId], enabled: !!run && !run.workflowSnapshot,
+    queryFn: async () => (await api.get<{ workflow: Workflow }>(`/workflows/${run?.workflowId}`)).data.workflow
   });
-
-  const logsQuery = useQuery({
-    queryKey: ["run-logs", runId],
-    enabled: Boolean(runQuery.data),
-    queryFn: async () => (await api.get<LogResponse>(`/runs/${runId}/logs`)).data
-  });
-
-  const cancelRun = useMutation({
-    mutationFn: async () => api.post(`/runs/${runId}/cancel`),
-    onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["run", runId] })
-  });
-
-  const rerunStep = useMutation({
-    mutationFn: async (input: { nodeId: string; itemId?: string }) => api.post(`/runs/${runId}/rerun`, input),
-    onMutate: () => {
-      setLiveLogs({});
-    },
-    onSuccess: async () => {
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["run", runId] }),
-        queryClient.invalidateQueries({ queryKey: ["run-logs", runId] })
-      ]);
-    }
-  });
-
+  const workflow = run?.workflowSnapshot || workflowQuery.data;
+  const items = run?.items || [];
+  const selected = items.find((item) => item.itemId === selectedId) || items[0];
+  const steps = selected?.steps || run?.steps || [];
+  const step = steps.find((step) => step.nodeId === nodeId) || steps.find((step) => step.status === "running") ||
+    steps.find((step) => step.status === "failed") || steps.find((step) => step.status === "cancelled") || steps[0];
+  const firstBlocked = steps.find((step) => rerunnable(step.status));
+  const counts = useMemo(() => {
+    const result: Record<string, number> = { await: 0, running: 0, success: 0, failed: 0, cancelled: 0 };
+    for (const item of items) result[item.status] = (result[item.status] || 0) + 1;
+    return result;
+  }, [items]);
+  useEffect(() => { setSelectedId(undefined); setNodeId(undefined); setCheckedIds([]); setTab(0); setNotice(undefined); }, [runId]);
   useEffect(() => {
-    if (!token || !runId) return;
-    const socket = io(API_URL, { auth: { token } });
-    socket.emit("run:join", runId);
-    socket.on("step:log", (payload: { itemId?: string; nodeId: string; message: string }) => {
-      const key = `${payload.itemId || ""}:${payload.nodeId}`;
-      setLiveLogs((current) => ({
-        ...current,
-        [key]: `${current[key] || ""}${payload.message}`
-      }));
-    });
-    const invalidate = () => {
-      void queryClient.invalidateQueries({ queryKey: ["run", runId] });
-      void queryClient.invalidateQueries({ queryKey: ["run-logs", runId] });
-    };
-    socket.on("step:status", invalidate);
-    socket.on("step:output", invalidate);
-    socket.on("run:status", invalidate);
-    socket.on("run:finished", invalidate);
-    socket.on("run:error", invalidate);
-    return () => {
-      socket.emit("run:leave", runId);
-      socket.disconnect();
-    };
-  }, [queryClient, runId, token]);
-
-  const selectedItem =
-    (selectedItemId && runQuery.data?.items?.find((item) => item.itemId === selectedItemId)) ||
-    runQuery.data?.items?.find((item) => item.status === "running") ||
-    runQuery.data?.items?.find((item) => item.status === "failed") ||
-    runQuery.data?.items?.[0] ||
-    null;
-  const activeSteps = selectedItem?.steps?.length ? selectedItem.steps : runQuery.data?.steps || [];
-  const firstRerunnableStep = useMemo(
-    () => activeSteps.find((step) => ["failed", "cancelled"].includes(step.status)),
-    [activeSteps]
-  );
-
-  const stepsByNode = useMemo(() => {
-    const map = new Map<string, RunStep>();
-    for (const step of activeSteps) {
-      map.set(step.nodeId, step);
+    if (!selectedId && items.length) setSelectedId((items.find((item) => item.status === "running") || items.find((item) => item.status === "failed") || items[0]).itemId);
+  }, [items, selectedId]);
+  const select = useCallback((id: string) => { setSelectedId(id); setNodeId(undefined); }, []);
+  const action = useMutation({
+    mutationFn: async (input: { type: "cancel" | "rerun"; itemIds?: string[]; nodeId?: string }) =>
+      (await api.post<ActionResult>(`/runs/${runId}/${input.type}`, { itemIds: input.itemIds, nodeId: input.nodeId })).data,
+    onSuccess: (result, input) => {
+      client.setQueryData<WorkflowRun>(["run", runId], (old) => old && (old.revision || 0) > (result.run.revision || 0) ? old : result.run);
+      setConfirmCancel(false);
+      setNotice({ warning: result.skipped.length > 0 || result.acceptedItemIds.length === 0,
+        text: `${input.type === "cancel" ? "Cancelled" : "Queued for rerun"}: ${result.acceptedItemIds.length} job(s).${result.skipped.length ? ` Skipped: ${result.skipped.map((item) => `${item.itemId}: ${item.reason}`).join("; ")}` : ""}` });
+      void client.invalidateQueries({ queryKey: ["workflow-runs", run?.workflowId] });
+    },
+    onError: (error: unknown) => {
+      const response = error as { response?: { data?: { message?: string } }; message?: string };
+      setNotice({ warning: true, text: response.response?.data?.message || response.message || "Action failed" });
     }
-    return map;
-  }, [activeSteps]);
+  });
+  const cancel = useCallback((ids: string[]) => action.mutate({ type: "cancel", itemIds: ids }), [action.mutate]);
+  const rerun = useCallback((ids: string[]) => action.mutate({ type: "rerun", itemIds: ids }), [action.mutate]);
+  const selectedActive = items.filter((item) => checked.has(item.itemId) && active(item.status));
+  const selectedRetry = items.filter((item) => checked.has(item.itemId) && rerunnable(item.status));
+  const completed = (counts.success || 0) + (counts.failed || 0) + (counts.cancelled || 0);
+  if (query.isError && !run) return <Alert severity="error">Unable to load this run. <Button onClick={() => void query.refetch()}>Try again</Button></Alert>;
+  if (!run) return <Stack alignItems="center" sx={{ p: 8 }}><CircularProgress /><Typography sx={{ mt: 2 }}>Loading run…</Typography></Stack>;
 
-  const graph = useMemo(() => {
-    const workflow = workflowQuery.data;
-    if (!workflow) {
-      return { nodes: [] as Node<ToolNodeData>[], edges: [] as Edge[] };
-    }
-    const repairedWorkflow = repairWorkflowGraphHandles(workflow);
-    return {
-      nodes: repairedWorkflow.nodes.map(
-        (node): Node<ToolNodeData> => ({
-          id: node.id,
-          type: "tool",
-          position: node.position,
-          data: {
-            workflowNode: node,
-            status: stepsByNode.get(node.id)?.status || "waiting"
-          }
-        })
-      ),
-      edges: repairedWorkflow.edges.map(
-        (edge): Edge => ({
-          id: edge.id,
-          source: edge.source,
-          target: edge.target,
-          sourceHandle: edge.sourceHandle,
-          targetHandle: edge.targetHandle,
-          type: "smoothstep",
-          animated: stepsByNode.get(edge.source)?.status === "running"
-        })
-      )
-    };
-  }, [stepsByNode, workflowQuery.data]);
-
-  const baseLogs = useMemo(() => {
-    const map: Record<string, string> = {};
-    for (const item of logsQuery.data?.logs || []) {
-      map[`${item.itemId || ""}:${item.nodeId}`] = item.log;
-    }
-    return map;
-  }, [logsQuery.data]);
-
-  const selectedStep =
-    (selectedNodeId && stepsByNode.get(selectedNodeId)) ||
-    activeSteps.find((step) => step.status === "running") ||
-    activeSteps.find((step) => step.status === "failed") ||
-    activeSteps[0];
-  const selectedNode =
-    selectedStep && graph.nodes.find((node) => node.id === selectedStep.nodeId)
-      ? graph.nodes.find((node) => node.id === selectedStep.nodeId)?.data.workflowNode || null
-      : null;
-  const selectedLogKey = selectedStep ? `${selectedItem?.itemId || ""}:${selectedStep.nodeId}` : "";
-  const selectedLogs = selectedStep
-    ? (baseLogs[selectedLogKey] || "").includes(liveLogs[selectedLogKey] || "")
-      ? baseLogs[selectedLogKey] || liveLogs[selectedLogKey] || ""
-      : `${baseLogs[selectedLogKey] || ""}${liveLogs[selectedLogKey] || ""}`
-    : "";
-  const visibleInputFiles = selectedItem?.inputFiles || runQuery.data?.inputFiles || [];
-  const visibleInputValues = selectedItem?.inputValues || [];
-  const visibleOutputFiles = selectedItem?.outputFiles || runQuery.data?.outputFiles || [];
-
-  if (!runQuery.data) {
-    return <Typography>Loading run...</Typography>;
-  }
-
-  return (
-    <Stack spacing={2}>
-      <Paper sx={{ p: 2 }} elevation={1}>
-        <Stack direction={{ xs: "column", md: "row" }} spacing={1.5} alignItems={{ md: "center" }}>
-          <Box sx={{ flexGrow: 1 }}>
-            <Typography variant="h5" sx={{ fontWeight: 700 }}>
-              Workflow Run
-            </Typography>
-            <Typography variant="body2" color="text.secondary">
-              {runQuery.data.workingDir}
-            </Typography>
-          </Box>
-          <Chip label={runQuery.data.status} sx={{ bgcolor: statusColor(runQuery.data.status), color: "#fff" }} />
-          <Button startIcon={<RefreshIcon />} variant="outlined" onClick={() => runQuery.refetch()}>
-            Refresh
-          </Button>
-          {["running", "pending"].includes(runQuery.data.status) && (
-            <Button
-              startIcon={<CancelIcon />}
-              color="error"
-              variant="outlined"
-              onClick={() => cancelRun.mutate()}
-              disabled={cancelRun.isPending}
-            >
-              Cancel
-            </Button>
-          )}
-          <Button component={RouterLink} to={`/workflows/${runQuery.data.workflowId}/runs`} variant="text">
-            History
-          </Button>
-        </Stack>
-      </Paper>
-
-      {runQuery.data.errorMessage && (
-        <Alert severity={runQuery.data.status === "failed" ? "error" : "warning"}>{runQuery.data.errorMessage}</Alert>
-      )}
-
-      {Boolean(runQuery.data.items?.length) && (
-        <Paper sx={{ overflow: "hidden" }} elevation={1}>
-          <Table size="small">
-            <TableHead>
-              <TableRow>
-                <TableCell>Batch Item</TableCell>
-                <TableCell>Status</TableCell>
-                <TableCell>Inputs</TableCell>
-                <TableCell>Outputs</TableCell>
-                <TableCell>Error</TableCell>
-                <TableCell align="right">View</TableCell>
-              </TableRow>
-            </TableHead>
-            <TableBody>
-              {(runQuery.data.items || []).map((item) => (
-                <TableRow key={item.itemId} selected={selectedItem?.itemId === item.itemId} hover>
-                  <TableCell>
-                    <Typography variant="body2" sx={{ fontWeight: 700 }} noWrap title={item.label}>
-                      {item.index + 1}. {item.label}
-                    </Typography>
-                  </TableCell>
-                  <TableCell>
-                    <Chip size="small" label={item.status} sx={{ bgcolor: statusColor(item.status), color: "#fff" }} />
-                  </TableCell>
-                  <TableCell>{(item.inputFiles?.length || 0) + (item.inputValues?.length || 0)}</TableCell>
-                  <TableCell>{item.outputFiles?.length || 0}</TableCell>
-                  <TableCell sx={{ maxWidth: 360 }}>
-                    {item.errorMessage && (
-                      <Typography variant="caption" color="error" noWrap title={item.errorMessage}>
-                        {item.errorMessage}
-                      </Typography>
-                    )}
-                  </TableCell>
-                  <TableCell align="right">
-                    <Button
-                      size="small"
-                      onClick={() => {
-                        setSelectedItemId(item.itemId);
-                        setSelectedNodeId(null);
-                      }}
-                    >
-                      View
-                    </Button>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </Paper>
-      )}
-
-      <Paper sx={{ overflow: "hidden" }} elevation={1}>
-        <Table size="small">
-          <TableHead>
-            <TableRow>
-              <TableCell>Step</TableCell>
-              <TableCell>Status</TableCell>
-              <TableCell>Command</TableCell>
-              <TableCell>Error</TableCell>
-              <TableCell align="right">Actions</TableCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {activeSteps.map((step) => (
-              <TableRow key={step.nodeId} selected={selectedStep?.nodeId === step.nodeId} hover>
-                <TableCell>{step.label}</TableCell>
-                <TableCell>
-                  <Chip size="small" label={step.status} sx={{ bgcolor: statusColor(step.status), color: "#fff" }} />
-                </TableCell>
-                <TableCell sx={{ maxWidth: 520, width: "38%" }}>
-                  <CommandPreview step={step} />
-                </TableCell>
-                <TableCell sx={{ maxWidth: 360 }}>
-                  {step.errorMessage && (
-                    <Typography variant="caption" color="error" noWrap title={step.errorMessage}>
-                      {step.errorMessage}
-                    </Typography>
-                  )}
-                </TableCell>
-                <TableCell align="right">
-                  <Stack direction="row" spacing={1} justifyContent="flex-end">
-                    {["failed", "cancelled"].includes(step.status) &&
-                      firstRerunnableStep?.nodeId === step.nodeId &&
-                      selectedItem &&
-                      !["running", "pending"].includes(selectedItem.status) && (
-                      <Button
-                        size="small"
-                        color="secondary"
-                        startIcon={<RestartAltIcon />}
-                        disabled={rerunStep.isPending}
-                        onClick={() => {
-                          setSelectedNodeId(step.nodeId);
-                          rerunStep.mutate({ nodeId: step.nodeId, itemId: selectedItem.itemId });
-                        }}
-                      >
-                        Rerun
-                      </Button>
-                    )}
-                    <Button size="small" onClick={() => setSelectedNodeId(step.nodeId)}>
-                      View
-                    </Button>
-                  </Stack>
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      </Paper>
-
-      <Paper
-        sx={{
-          height: "calc(100vh - 245px)",
-          minHeight: 560,
-          overflow: "hidden",
-          "& .react-flow": {
-            bgcolor: "background.default"
-          },
-          "& .react-flow__controls": {
-            boxShadow: 2
-          },
-          "& .react-flow__controls-button": {
-            bgcolor: "background.paper",
-            color: "text.primary",
-            borderBottom: "1px solid",
-            borderColor: "divider",
-            "&:hover": {
-              bgcolor: "action.hover"
-            },
-            "& svg": {
-              fill: "currentColor"
-            }
-          },
-          "& .react-flow__minimap": {
-            bgcolor: "background.paper",
-            border: "1px solid",
-            borderColor: "divider",
-            borderRadius: 1,
-            overflow: "hidden"
-          },
-          "& .react-flow__attribution": {
-            bgcolor: "background.paper",
-            color: "text.secondary"
-          }
-        }}
-        elevation={1}
-      >
-        <Box sx={{ display: "flex", height: "100%" }}>
-          <Box sx={{ flexGrow: 1, minWidth: 0 }}>
-            <ReactFlow<Node<ToolNodeData>, Edge>
-              nodes={graph.nodes}
-              edges={graph.edges}
-              nodeTypes={nodeTypes}
-              nodesDraggable={false}
-              nodesConnectable={false}
-              elementsSelectable
-              onNodeClick={(_event, node) => setSelectedNodeId(node.id)}
-              fitView
-            >
-              <Background color={theme.palette.divider} />
-              <Controls />
-              <MiniMap
-                pannable
-                zoomable
-                bgColor={theme.palette.background.paper}
-                maskColor={theme.palette.mode === "dark" ? "rgba(0,0,0,0.45)" : "rgba(245,247,251,0.72)"}
-                nodeColor={theme.palette.mode === "dark" ? "#354052" : "#d9e2ef"}
-              />
-            </ReactFlow>
-          </Box>
-          <Divider orientation="vertical" flexItem />
-          <NodeConfigPanel
-            node={selectedNode}
-            step={selectedStep}
-            logs={selectedLogs}
-            readOnly
-            onClose={() => setSelectedNodeId(null)}
-          />
-        </Box>
-      </Paper>
-
-      <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "1fr 1fr" }, gap: 2 }}>
-        <Paper sx={{ p: 2 }} elevation={1}>
-          <Typography variant="h6" sx={{ mb: 1 }}>
-            Inputs
-          </Typography>
-          <Stack spacing={1.5}>
-            {visibleInputValues.map((value) => (
-              <Box
-                key={`${value.name}-${value.value}`}
-                sx={{ border: "1px solid", borderColor: "divider", borderRadius: 1, p: 1.25 }}
-              >
-                <Typography variant="caption" color="text.secondary">
-                  {value.name}
-                </Typography>
-                <Typography variant="body2" sx={{ fontFamily: "monospace", wordBreak: "break-all" }}>
-                  {value.value}
-                </Typography>
-              </Box>
-            ))}
-            {visibleInputFiles.map((file) => (
-              <FilePreview key={file.relativePath} file={file} />
-            ))}
-            {!visibleInputFiles.length && !visibleInputValues.length && (
-              <Typography variant="body2" color="text.secondary">
-                No input files recorded.
-              </Typography>
-            )}
-          </Stack>
-        </Paper>
-
-        <Paper sx={{ p: 2 }} elevation={1}>
-          <Typography variant="h6" sx={{ mb: 1 }}>
-            Outputs
-          </Typography>
-          <Stack spacing={1.5}>
-            {visibleOutputFiles.map((file) => (
-              <FilePreview key={file.relativePath} file={file} />
-            ))}
-            {!visibleOutputFiles.length && (
-              <Typography variant="body2" color="text.secondary">
-                No outputs yet.
-              </Typography>
-            )}
-          </Stack>
-        </Paper>
-      </Box>
+  return <Stack spacing={2.5}>
+    <Stack direction="row" alignItems="center" justifyContent="space-between">
+      <Button component={RouterLink} to={`/workflows/${run.workflowId}/runs`} startIcon={<ArrowBackIcon />} size="small">Run history</Button>
+      <Stack direction="row" spacing={1} alignItems="center"><Box sx={{ width: 7, height: 7, borderRadius: "50%", bgcolor: connected ? "success.main" : "warning.main" }} />
+        <Typography variant="caption" color="text.secondary">{connected ? "Live updates" : "Reconnecting · refresh every 5s"}</Typography>
+        <Button size="small" startIcon={<RefreshIcon />} onClick={() => void query.refetch()}>Refresh</Button></Stack>
     </Stack>
-  );
+    <Paper variant="outlined" sx={{ p: { xs: 2, md: 2.5 }, borderRadius: 2 }}>
+      <Stack direction={{ xs: "column", md: "row" }} spacing={2} alignItems={{ md: "center" }}>
+        <Box sx={{ flex: 1, minWidth: 0 }}>
+          <Typography variant="overline" color="text.secondary" sx={{ letterSpacing: 1.4 }}>WORKFLOW RUN</Typography>
+          <Stack direction="row" alignItems="center" spacing={1.5}><Typography variant="h5" fontWeight={700} noWrap>{workflow?.name || "Workflow"}</Typography>
+            <Chip size="small" label={run.status} sx={{ bgcolor: `${statusColor(run.status)}18`, color: statusColor(run.status), fontWeight: 700 }} /></Stack>
+          <Typography variant="caption" color="text.secondary" sx={{ overflowWrap: "anywhere" }}>{runId} · {new Date(run.createdAt).toLocaleString()} · {duration(run.startedAt, run.finishedAt)}</Typography>
+        </Box>
+        <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+          <Button variant="outlined" startIcon={<RestartAltIcon />} disabled={action.isPending || !(counts.failed + counts.cancelled || (!items.length && rerunnable(run.status)))} onClick={() => action.mutate({ type: "rerun" })}>Rerun failed / cancelled</Button>
+          <Button variant="outlined" color="error" startIcon={<StopCircleOutlinedIcon />} disabled={action.isPending || (!(counts.await + counts.running) && !active(run.status))} onClick={() => setConfirmCancel(true)}>Cancel all</Button>
+        </Stack>
+      </Stack>
+      <Stack direction="row" spacing={1.5} flexWrap="wrap" useFlexGap sx={{ mt: 2.5, mb: 1.5 }}>
+        {Object.entries(counts).map(([status, count]) => <Stack key={status} direction="row" spacing={0.75} alignItems="center">
+          <Box sx={{ width: 8, height: 8, borderRadius: "50%", bgcolor: statusColor(status as WorkflowRun["status"]) }} />
+          <Typography variant="body2" color="text.secondary">{status} <Box component="span" sx={{ color: "text.primary", fontWeight: 700 }}>{count}</Box></Typography>
+        </Stack>)}
+        <Typography variant="body2" color="text.secondary" sx={{ ml: "auto !important" }}>{completed}/{items.length} finished</Typography>
+      </Stack>
+      <LinearProgress variant="determinate" value={items.length ? completed / items.length * 100 : 0} sx={{ height: 5, borderRadius: 3 }} />
+    </Paper>
+    {notice && <Alert severity={notice.warning ? "warning" : "success"} onClose={() => setNotice(undefined)} sx={{ overflowWrap: "anywhere" }}>{notice.text}</Alert>}
+    {query.isError && <Alert severity="warning">Connection interrupted. The last received state is shown.</Alert>}
+    {run.errorMessage && <Alert severity={run.status === "failed" ? "error" : "warning"}>{run.errorMessage}</Alert>}
+    {!!checkedIds.length && <Paper variant="outlined" sx={{ px: 2, py: 1, borderRadius: 2 }}><Stack direction="row" alignItems="center" spacing={1} flexWrap="wrap" useFlexGap>
+      <Typography variant="body2" fontWeight={600} sx={{ flex: 1 }}>{checkedIds.length} selected</Typography>
+      <Button size="small" onClick={() => setCheckedIds([])}>Clear selection</Button>
+      <Button size="small" disabled={!selectedRetry.length || action.isPending} onClick={() => rerun(selectedRetry.map((item) => item.itemId))}>Rerun selected ({selectedRetry.length})</Button>
+      <Button size="small" color="error" disabled={!selectedActive.length || action.isPending} onClick={() => cancel(selectedActive.map((item) => item.itemId))}>Cancel selected ({selectedActive.length})</Button>
+    </Stack></Paper>}
+    <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "360px minmax(0, 1fr)" }, gap: 2 }}>
+      {!!items.length && <Paper variant="outlined" sx={{ overflow: "hidden", borderRadius: 2, alignSelf: "start" }}>
+        <RunJobs items={items} selectedId={selected?.itemId} checked={checked} pending={action.isPending} onSelect={select} onChecked={setCheckedIds} onCancel={cancel} onRerun={rerun} />
+      </Paper>}
+      <Paper variant="outlined" sx={{ minWidth: 0, borderRadius: 2, overflow: "hidden", gridColumn: items.length ? undefined : "1 / -1" }}>
+        <Box sx={{ p: 2, borderBottom: "1px solid", borderColor: "divider" }}>
+          <Stack direction="row" spacing={1} alignItems="center"><Typography variant="subtitle1" fontWeight={700} noWrap title={selected?.label} sx={{ flex: 1 }}>{selected ? `${selected.index + 1}. ${selected.label}` : "Run details"}</Typography>
+            {selected && <Chip size="small" label={selected.cancelRequestedAt ? "Cancelling…" : selected.status} variant="outlined" />}</Stack>
+          {selected && <Typography variant="caption" color="text.secondary">{selected.steps.filter((step) => step.status === "success").length}/{selected.steps.length} steps · {duration(selected.startedAt, selected.finishedAt)}</Typography>}
+          {selected?.waitReason && <Typography variant="body2" color="text.secondary">{selected.waitReason}</Typography>}
+        </Box>
+        <Tabs value={tab} onChange={(_, value) => setTab(value)} variant="scrollable" sx={{ px: 1, borderBottom: "1px solid", borderColor: "divider" }}>
+          <Tab label="Steps & Logs" /><Tab label={`Files (${selected?.outputFiles?.length ?? run.outputFiles.length})`} /><Tab label="Workflow" />
+        </Tabs>
+        <Box sx={{ p: { xs: 1.5, md: 2 } }}><Suspense fallback={<Box sx={{ p: 4, textAlign: "center" }}><CircularProgress size={24} /></Box>}>
+          {tab === 0 && <Stack spacing={2}>
+            <Stack spacing={0.5}>{steps.map((current, index) => <Box key={current.nodeId} sx={{ display: "flex", alignItems: "center", gap: 1, px: 1.25, py: 1,
+              borderRadius: 1, bgcolor: step?.nodeId === current.nodeId ? "action.selected" : "transparent", border: "1px solid", borderColor: step?.nodeId === current.nodeId ? "divider" : "transparent" }}>
+              <Button color="inherit" onClick={() => setNodeId(current.nodeId)} sx={{ justifyContent: "flex-start", flex: 1, minWidth: 0 }}><Typography variant="body2" noWrap>{index + 1}. {current.label}</Typography></Button>
+              <Typography variant="caption" color="text.secondary" sx={{ display: { xs: "none", sm: "block" } }}>{duration(current.startedAt, current.finishedAt)}</Typography>
+              <Chip size="small" label={current.status} sx={{ color: statusColor(current.status), bgcolor: `${statusColor(current.status)}18` }} />
+              {selected && firstBlocked?.nodeId === current.nodeId && rerunnable(selected.status) && <Button size="small" disabled={action.isPending} onClick={() => action.mutate({ type: "rerun", itemIds: [selected.itemId], nodeId: current.nodeId })}>Rerun</Button>}
+            </Box>)}</Stack>
+            {step?.errorMessage && <Alert severity={step.status === "failed" ? "error" : "warning"}>{step.errorMessage}</Alert>}
+            {step?.command && <Box sx={{ p: 1.5, bgcolor: "action.hover", borderRadius: 1, minWidth: 0 }}><Typography variant="caption" color="text.secondary">COMMAND</Typography>
+              <Typography component="pre" sx={{ m: 0, mt: 0.5, fontSize: 12, overflow: "auto", whiteSpace: "pre" }}>{[step.command, ...(step.args || [])].join(" ")}</Typography></Box>}
+            {step && <RunLogs runId={runId} itemId={selected?.itemId} step={step} socket={socket} connected={connected} />}
+          </Stack>}
+          {tab === 1 && <RunFiles key={selected?.itemId || runId} inputs={selected?.inputFiles || run.inputFiles} values={selected?.inputValues || []} outputs={selected?.outputFiles || run.outputFiles} />}
+          {tab === 2 && (workflow ? <RunGraph workflow={workflow} steps={steps} onSelect={(id) => { setNodeId(id); setTab(0); }} /> : <Alert severity="info">Workflow configuration is unavailable for this legacy run.</Alert>)}
+        </Suspense></Box>
+      </Paper>
+    </Box>
+    <ConfirmDialog open={confirmCancel} title="Cancel all active jobs?" description={`Cancel ${counts.await + counts.running || (active(run.status) ? 1 : 0)} running or waiting job(s) in this run? Completed results are kept.`}
+      confirmLabel="Cancel all" loading={action.isPending} onCancel={() => setConfirmCancel(false)} onConfirm={() => action.mutate({ type: "cancel" })} />
+  </Stack>;
 }

@@ -4,6 +4,7 @@ import { Server, type Socket } from "socket.io";
 import { isAllowedCorsOrigin } from "../config/cors";
 import { env } from "../config/env";
 import { RunModel } from "../models/Run";
+import { Types } from "mongoose";
 
 interface SocketPayload {
   sub: string;
@@ -12,6 +13,7 @@ interface SocketPayload {
 
 class SocketService {
   private io?: Server;
+  private logTimers = new Map<string, NodeJS.Timeout>();
 
   initialize(httpServer: HttpServer) {
     this.io = new Server(httpServer, {
@@ -47,20 +49,52 @@ class SocketService {
   }
 
   private registerHandlers(socket: Socket) {
-    socket.on("run:join", async (runId: string) => {
-      const run = await RunModel.findOne({ _id: runId, userId: socket.data.userId }).select("_id").lean();
-      if (run) {
-        socket.join(this.room(runId));
-      }
+    socket.on("run:join", async (runId: string, acknowledge?: (value: unknown) => void) => {
+      try {
+        if (!Types.ObjectId.isValid(runId)) return;
+        const run = await RunModel.findOne({ _id: runId, userId: socket.data.userId }).select("_id").lean();
+        if (run) { await socket.join(this.room(runId)); acknowledge?.({ joined: true }); }
+      } catch { acknowledge?.({ joined: false }); }
     });
 
     socket.on("run:leave", (runId: string) => {
       socket.leave(this.room(runId));
     });
+    socket.on("log:watch", async (input: { runId: string; itemId: string; nodeId: string; attemptId: string }, acknowledge?: (value: unknown) => void) => {
+      try {
+        if (!input || !Types.ObjectId.isValid(input.runId) || ![input.itemId, input.nodeId, input.attemptId].every((value) => typeof value === "string" && value.length < 256)) return;
+        for (const room of socket.rooms) if (room.startsWith("log:")) await socket.leave(room);
+        if (await RunModel.exists({ _id: input.runId, userId: socket.data.userId })) {
+          await socket.join(this.logRoom(input.runId, input.itemId, input.nodeId, input.attemptId));
+          acknowledge?.({ joined: true });
+        }
+      } catch { acknowledge?.({ joined: false }); }
+    });
+    socket.on("log:unwatch", () => {
+      for (const room of socket.rooms) if (room.startsWith("log:")) socket.leave(room);
+    });
   }
 
   emitToRun(runId: string, event: string, payload: unknown) {
     this.io?.to(this.room(runId)).emit(event, payload);
+  }
+
+  notifyLog(runId: string, itemId: string, nodeId: string, attemptId: string) {
+    const room = this.logRoom(runId, itemId, nodeId, attemptId);
+    if (!this.io?.sockets.adapter.rooms.has(room)) return;
+    if (this.logTimers.has(room)) return;
+    const timer = setTimeout(() => {
+      this.logTimers.delete(room);
+      // Disk is the cursor-addressed source of truth; never buffer unbounded log
+      // strings in Socket.IO, including for clients which are paused or hidden.
+      this.io?.to(room).emit("log:changed", { runId, itemId, nodeId, attemptId });
+    }, 250);
+    timer.unref();
+    this.logTimers.set(room, timer);
+  }
+
+  private logRoom(runId: string, itemId: string, nodeId: string, attemptId: string) {
+    return `log:${JSON.stringify([runId, itemId, nodeId, attemptId])}`;
   }
 
   private room(runId: string) {

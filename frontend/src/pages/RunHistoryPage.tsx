@@ -26,7 +26,7 @@ import type { Workflow, WorkflowRun } from "../types/domain";
 import { readableBytes, statusColor } from "../utils/status";
 
 function canDeleteRun(run: WorkflowRun) {
-  return run.status !== "running" && run.status !== "pending";
+  return run.status !== "running" && run.status !== "await";
 }
 
 export function RunHistoryPage() {
@@ -100,7 +100,7 @@ export function RunHistoryPage() {
             <InputLabel>Status</InputLabel>
             <Select label="Status" value={status} onChange={(event) => setStatus(event.target.value)}>
               <MenuItem value="">All</MenuItem>
-              <MenuItem value="pending">Pending</MenuItem>
+              <MenuItem value="await">Await</MenuItem>
               <MenuItem value="running">Running</MenuItem>
               <MenuItem value="success">Success</MenuItem>
               <MenuItem value="failed">Failed</MenuItem>

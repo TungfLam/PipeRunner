@@ -1,6 +1,6 @@
 export type PreviewType = "video" | "audio" | "text" | "json" | "image";
-export type RunStatus = "pending" | "running" | "success" | "failed" | "cancelled";
-export type StepStatus = "waiting" | "running" | "success" | "failed" | "skipped" | "cancelled";
+export type RunStatus = "await" | "running" | "success" | "failed" | "cancelled";
+export type StepStatus = "await" | "running" | "success" | "failed" | "skipped" | "cancelled";
 
 export interface User {
   id: string;
@@ -93,6 +93,7 @@ export interface RunInputValue {
 }
 
 export interface RunStep {
+  attemptId?: string;
   nodeId: string;
   label: string;
   status: StepStatus;
@@ -108,6 +109,10 @@ export interface RunStep {
 }
 
 export interface WorkflowRunItem {
+  attemptId?: string;
+  waitReason?: string;
+  cancelRequestedAt?: string;
+  process?: { pid: number; startTime?: string; bootId?: string };
   itemId: string;
   index: number;
   label: string;
@@ -124,6 +129,8 @@ export interface WorkflowRunItem {
 }
 
 export interface WorkflowRun {
+  revision?: number;
+  workflowSnapshot?: Pick<Workflow, "name" | "nodes" | "edges">;
   _id: string;
   userId: string;
   projectId: string;

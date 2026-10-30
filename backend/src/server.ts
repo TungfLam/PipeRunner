@@ -13,10 +13,15 @@ import { runsRouter } from "./routes/runs.routes";
 import { workflowsRouter } from "./routes/workflows.routes";
 import { fileStorageService } from "./services/fileStorage.service";
 import { socketService } from "./services/socket.service";
+import { workflowRunnerService } from "./services/workflowRunner.service";
+import { acquireBackendLease } from "./services/backendLease";
 
 async function main() {
   await fileStorageService.ensureRoot();
   await mongoose.connect(env.MONGODB_URI);
+  const releaseLease = await acquireBackendLease();
+  const recovered = await workflowRunnerService.recoverInterruptedRuns();
+  console.log(`Recovered ${recovered} interrupted or legacy run(s)`);
 
   const app = express();
   app.use(cors(corsOptions));
@@ -37,6 +42,23 @@ async function main() {
 
   const server = http.createServer(app);
   socketService.initialize(server);
+
+  let stopping = false;
+  const shutdown = async () => {
+    if (stopping) return;
+    stopping = true;
+    server.close();
+    const deadline = setTimeout(() => process.exit(1), 15000);
+    deadline.unref();
+    try {
+      await workflowRunnerService.shutdown();
+      await mongoose.disconnect();
+      await releaseLease();
+      process.exit(0);
+    } catch (error) { console.error(error); process.exit(1); }
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
 
   server.listen(env.PORT, () => {
     console.log(`Backend listening on http://localhost:${env.PORT}`);

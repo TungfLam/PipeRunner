@@ -9,11 +9,10 @@ export function statusColor(status?: RunStatus | StepStatus) {
     case "failed":
       return "#c62828";
     case "skipped":
-    case "pending":
+    case "await":
       return "#ed6c02";
     case "cancelled":
       return "#6d4c41";
-    case "waiting":
     default:
       return "#6b7280";
   }

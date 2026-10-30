@@ -8,6 +8,7 @@ import { asyncHandler } from "../utils/asyncHandler";
 import { HttpError } from "../utils/httpError";
 import { workflowGraphSchema } from "../utils/validation";
 import { repairWorkflowGraphHandles } from "../utils/workflowHandles";
+import { workflowRunnerService } from "../services/workflowRunner.service";
 
 const workflowBaseSchema = z.object({
   name: z.string().min(1).max(160),
@@ -88,6 +89,7 @@ export const updateWorkflow = asyncHandler<AuthenticatedRequest>(async (req, res
   if (!workflow) {
     throw new HttpError(404, "Workflow not found");
   }
+  workflowRunnerService.updateLimits(req.user.id, req.params.workflowId, workflowGraphSchema.parse(workflow).nodes, workflow.updatedAt);
   res.json({ workflow });
 });
 

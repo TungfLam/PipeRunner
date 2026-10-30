@@ -22,6 +22,7 @@ export function FilePreview({ file }: Props) {
   useEffect(() => {
     let cancelled = false;
     let url = "";
+    const abort = new AbortController();
 
     async function loadPreview() {
       setLoading(true);
@@ -32,7 +33,8 @@ export function FilePreview({ file }: Props) {
         if (file.preview === "text" || file.preview === "json") {
           const response = await api.get("/files/preview", {
             params: { path: file.relativePath },
-            responseType: "text"
+            responseType: "text",
+            signal: abort.signal
           });
           if (cancelled) return;
           const value = String(response.data);
@@ -42,7 +44,8 @@ export function FilePreview({ file }: Props) {
         if (file.preview) {
           const response = await api.get("/files/preview", {
             params: { path: file.relativePath },
-            responseType: "blob"
+            responseType: "blob",
+            signal: abort.signal
           });
           if (cancelled) return;
           url = URL.createObjectURL(response.data);
@@ -62,6 +65,7 @@ export function FilePreview({ file }: Props) {
     void loadPreview();
     return () => {
       cancelled = true;
+      abort.abort();
       if (url) URL.revokeObjectURL(url);
     };
   }, [file.relativePath, file.preview]);
@@ -108,9 +112,9 @@ export function FilePreview({ file }: Props) {
         <Box component="img" src={objectUrl} alt={file.name} sx={{ maxWidth: "100%", maxHeight: 360 }} />
       )}
       {objectUrl && file.preview === "video" && (
-        <Box component="video" src={objectUrl} controls sx={{ width: "100%", maxHeight: 360 }} />
+        <Box component="video" src={objectUrl} controls preload="metadata" sx={{ width: "100%", maxHeight: 360 }} />
       )}
-      {objectUrl && file.preview === "audio" && <Box component="audio" src={objectUrl} controls sx={{ width: "100%" }} />}
+      {objectUrl && file.preview === "audio" && <Box component="audio" src={objectUrl} controls preload="metadata" sx={{ width: "100%" }} />}
     </Box>
   );
 }

@@ -7,6 +7,8 @@ import { fileStorageService, sanitizeFileName } from "../services/fileStorage.se
 import { workflowRunnerService } from "../services/workflowRunner.service";
 import { asyncHandler } from "../utils/asyncHandler";
 import { HttpError } from "../utils/httpError";
+import { readLogWindow } from "../services/logReader";
+import { isActiveStatus } from "../services/runState";
 
 const runBodySchema = z.object({
   inputs: z.record(z.string(), z.union([z.string(), z.array(z.string())])).optional().default({}),
@@ -20,9 +22,12 @@ const bulkDeleteRunsSchema = z.object({
 });
 
 const rerunBodySchema = z.object({
-  itemId: z.string().optional(),
-  nodeId: z.string().min(1)
-});
+  itemId: z.string().min(1).max(255).optional(),
+  itemIds: z.array(z.string().min(1).max(255)).min(1).max(10000).optional(),
+  nodeId: z.string().min(1).max(255).optional()
+}).refine((body) => !(body.itemId && body.itemIds), "Use itemId or itemIds, not both");
+
+const cancelBodySchema = z.object({ itemIds: z.array(z.string().min(1).max(255)).min(1).max(10000).optional() });
 
 function parseJsonField(value: unknown) {
   if (typeof value !== "string") {
@@ -60,7 +65,7 @@ export const listWorkflowRuns = asyncHandler<AuthenticatedRequest>(async (req, r
   }
   const filter: Record<string, unknown> = { workflowId: workflow._id, userId: req.user.id };
   if (typeof req.query.status === "string" && req.query.status) {
-    filter.status = req.query.status;
+    filter.status = ["pending", "waiting"].includes(req.query.status) ? "await" : req.query.status;
   }
   const runs = await RunModel.find(filter).sort({ createdAt: -1 }).limit(100).lean();
   const runsWithStorage = await Promise.all(
@@ -87,14 +92,13 @@ export const getRun = asyncHandler<AuthenticatedRequest>(async (req, res: Respon
 });
 
 export const cancelRun = asyncHandler<AuthenticatedRequest>(async (req, res: Response) => {
-  const run = await workflowRunnerService.cancelRun(req.user.id, req.params.runId);
-  res.json({ run });
+  const body = cancelBodySchema.parse(req.body || {});
+  res.json(await workflowRunnerService.cancelRun(req.user.id, req.params.runId, body.itemIds));
 });
 
 export const rerunRunFromStep = asyncHandler<AuthenticatedRequest>(async (req, res: Response) => {
-  const body = rerunBodySchema.parse(req.body);
-  const run = await workflowRunnerService.rerunFromNode(req.user.id, req.params.runId, body.nodeId, body.itemId);
-  res.json({ run });
+  const body = rerunBodySchema.parse(req.body || {});
+  res.json(await workflowRunnerService.rerunFromNode(req.user.id, req.params.runId, body.nodeId, body.itemId, body.itemIds));
 });
 
 export const bulkDeleteRuns = asyncHandler<AuthenticatedRequest>(async (req, res: Response) => {
@@ -113,7 +117,7 @@ export const bulkDeleteRuns = asyncHandler<AuthenticatedRequest>(async (req, res
       continue;
     }
 
-    if (run.status === "running" || run.status === "pending") {
+    if (isActiveStatus(run.status)) {
       skipped.push({ runId, reason: "run_is_active" });
       continue;
     }
@@ -129,6 +133,11 @@ export const bulkDeleteRuns = asyncHandler<AuthenticatedRequest>(async (req, res
 });
 
 export const getRunLogs = asyncHandler<AuthenticatedRequest>(async (req, res: Response) => {
+  const query = z.object({
+    nodeId: z.string().max(255).optional(), itemId: z.string().max(255).optional(), attemptId: z.string().max(255).optional(),
+    cursor: z.coerce.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    before: z.coerce.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional()
+  }).parse(req.query);
   const run = await RunModel.findOne({ _id: req.params.runId, userId: req.user.id }).lean();
   if (!run) {
     throw new HttpError(404, "Run not found");
@@ -137,24 +146,29 @@ export const getRunLogs = asyncHandler<AuthenticatedRequest>(async (req, res: Re
   const logSources = run.items?.length
     ? run.items.flatMap((item) =>
         (item.steps || [])
-          .filter((step) => !req.query.nodeId || step.nodeId === req.query.nodeId)
-          .filter((step) => !req.query.itemId || item.itemId === req.query.itemId)
+          .filter((step) => !query.nodeId || step.nodeId === query.nodeId)
+          .filter((step) => !query.itemId || item.itemId === query.itemId)
           .map((step) => ({ itemId: item.itemId, itemLabel: item.label, step, baseDir: item.workingDir }))
       )
     : (run.steps || [])
-        .filter((step) => !req.query.nodeId || step.nodeId === req.query.nodeId)
+        .filter((step) => !query.nodeId || step.nodeId === query.nodeId)
         .map((step) => ({ itemId: undefined, itemLabel: undefined, step, baseDir: run.workingDir }));
 
   const logs = await Promise.all(
     logSources.map(async (source) => {
-      const guessedLogPath = source.baseDir ? `${source.baseDir}/logs/${sanitizeFileName(source.step.nodeId)}.log` : undefined;
+      const guessedLogPath = source.baseDir && !source.step.attemptId ? `${source.baseDir}/logs/${sanitizeFileName(source.step.nodeId)}.log` : undefined;
       const logPath = source.step.logPath || guessedLogPath;
+      if (query.attemptId && query.attemptId !== source.step.attemptId) throw new HttpError(409, "Log attempt has changed; refresh the job");
       if (!logPath) {
-        return { itemId: source.itemId, itemLabel: source.itemLabel, nodeId: source.step.nodeId, label: source.step.label, log: "" };
+        return { itemId: source.itemId, nodeId: source.step.nodeId, attemptId: source.step.attemptId, log: "", startCursor: 0, nextCursor: 0, totalBytes: 0, hasMore: false };
       }
       fileStorageService.assertUserOwnsPath(req.user.id, logPath);
-      const log = await fileStorageService.readText(logPath, 5_000_000).catch(() => "");
-      return { itemId: source.itemId, itemLabel: source.itemLabel, nodeId: source.step.nodeId, label: source.step.label, logPath, log };
+      const window = await readLogWindow(fileStorageService.resolveRelativePath(logPath), {
+        cursor: query.cursor, before: query.before, complete: !isActiveStatus(source.step.status),
+        limit: Math.max(4, Math.floor(256 * 1024 / Math.max(1, logSources.length)))
+      });
+      return { itemId: source.itemId, itemLabel: source.itemLabel, nodeId: source.step.nodeId, label: source.step.label,
+        attemptId: source.step.attemptId, logPath, ...window };
     })
   );
 
@@ -175,7 +189,7 @@ export const downloadRunFile = asyncHandler<AuthenticatedRequest>(async (req, re
   const run = await RunModel.findOne({
     _id: req.params.runId,
     userId: req.user.id,
-    $or: [{ "inputFiles.relativePath": relativePath }, { "outputFiles.relativePath": relativePath }, { "steps.logPath": relativePath }]
+    $or: [{ "inputFiles.relativePath": relativePath }, { "outputFiles.relativePath": relativePath }, { "steps.logPath": relativePath }, { "items.steps.logPath": relativePath }]
   }).lean();
   if (!run) {
     throw new HttpError(404, "Run file not found");

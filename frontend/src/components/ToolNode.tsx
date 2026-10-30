@@ -10,12 +10,13 @@ export interface ToolNodeData {
   [key: string]: unknown;
   workflowNode: WorkflowNodeConfig;
   status?: StepStatus;
+  animate?: boolean;
 }
 
 export function ToolNode({ data, selected }: NodeProps) {
   const typedData = data as unknown as ToolNodeData;
   const node = typedData.workflowNode;
-  const status = typedData.status || "waiting";
+  const status = typedData.status || "await";
   const borderColor = statusColor(status);
 
   const inputTop = (index: number, total: number) => `${((index + 1) / (total + 1)) * 100}%`;
@@ -24,7 +25,7 @@ export function ToolNode({ data, selected }: NodeProps) {
 
   return (
     <Box
-      className={status === "running" ? "tool-node-running" : undefined}
+      className={status === "running" && typedData.animate !== false ? "tool-node-running" : undefined}
       sx={{
         width: 340,
         minHeight: 136,
