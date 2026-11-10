@@ -91,6 +91,7 @@ try {
   const read = async (id) => (await request(`/runs/${id}`, undefined, token)).run;
   const finished = (id) => waitFor(async () => { const run = await read(id); return !["await", "running"].includes(run.status) && run; }, `run ${id} completion`);
   let first;
+  const exportFlows = {};
 
   await test("Shared concurrency, queued status, individual cancel and duplicate bulk rerun", async () => {
     first = await start(6, 500);
@@ -222,6 +223,52 @@ try {
     assert.equal((await finished(String(legacyId))).status, "success");
   });
 
+  await test("File and text inputs share numbered auto-download roots", async () => {
+    const exportRoot = path.join(data, "shared-exports");
+    await fs.mkdir(path.join(exportRoot, "4"), { recursive: true });
+    await fs.mkdir(path.join(exportRoot, "2"), { recursive: true });
+    const verify = async (runId, numbers) => {
+      const run = await finished(runId);
+      assert.equal(run.status, "success");
+      assert.deepEqual(run.items.map((item) => item.exportDir), numbers.map((number) => path.join(exportRoot, String(number))));
+      for (const item of run.items) {
+        const file = item.outputFiles[0];
+        assert.equal(await fs.readFile(path.join(item.exportDir, path.basename(file.relativePath)), "utf8"),
+          await fs.readFile(path.join(data, file.relativePath), "utf8"));
+      }
+      return run;
+    };
+    for (const type of ["text", "file"]) {
+      const node = tool("A");
+      node.inputs[0].type = type;
+      node.outputs[0].autoDownload = true;
+      exportFlows[type] = await createWorkflow([node]);
+    }
+    const text = (await request(`/workflows/${exportFlows.text._id}/runs`, {
+      textInputs: { value: ["first", "second"] }, exportRoot, params: { delay: 20 }
+    }, token, "POST", 201)).run;
+    await verify(text._id, [5, 6]);
+    const form = new FormData();
+    form.append("value", new Blob(["first subtitle"]), "one.srt");
+    form.append("value", new Blob(["second subtitle"]), "two.srt");
+    form.append("exportRoot", exportRoot);
+    form.append("params", JSON.stringify({ delay: 20 }));
+    const response = await fetch(`${base}/api/workflows/${exportFlows.file._id}/runs`, {
+      method: "POST", headers: { Authorization: `Bearer ${token}` }, body: form
+    });
+    assert.equal(response.status, 201);
+    const files = await verify((await response.json()).run._id, [7, 8]);
+    const selected = (await request(`/workflows/${exportFlows.file._id}/runs`, {
+      inputs: { value: files.items.map((item) => item.inputFiles[0].relativePath) }, exportRoot, params: { delay: 20 }
+    }, token, "POST", 201)).run;
+    await verify(selected._id, [9, 10]);
+    for (const type of ["text", "file"]) {
+      await request(`/workflows/${exportFlows[type]._id}/runs`, {
+        textInputs: { value: ["unused"] }, exportRoot: "relative/path", params: { delay: 20 }
+      }, token, "POST", 400);
+    }
+  });
+
   await command(process.execPath, ["node_modules/vite/bin/vite.js", "build", "frontend", "--outDir", path.join(data, "web"), "--emptyOutDir"], { env: { ...env, NODE_ENV: "production" } });
   frontend = spawn(process.execPath, ["node_modules/vite/bin/vite.js", "preview", "frontend", "--outDir", path.join(data, "web"), "--host", "127.0.0.1", "--port", String(webPort), "--strictPort"], { cwd: root, env, stdio: "ignore" });
   await waitFor(() => fetch(web).then((response) => response.ok).catch(() => false), "frontend");
@@ -232,6 +279,33 @@ try {
   }, auth);
   const page = await context.newPage();
   const errors = []; page.on("pageerror", (error) => errors.push(error.message));
+
+  await test("Browser: both input types show the same root field and export into numbered folders", async () => {
+    for (const type of ["text", "file"]) {
+      const flow = exportFlows[type];
+      const exportRoot = path.join(data, `browser-${type}-exports`);
+      await page.goto(`${web}/projects/${project._id}/workflows/${flow._id}`);
+      await page.getByRole("button", { name: "Run", exact: true }).click();
+      const dialog = page.getByRole("dialog");
+      const rootField = dialog.getByRole("textbox", { name: "Auto download root folder", exact: true });
+      await rootField.waitFor();
+      await rootField.fill(exportRoot);
+      if (type === "text") await dialog.getByRole("textbox", { name: "value *", exact: true }).fill("subtitle text");
+      else await dialog.locator('input[type="file"]').setInputFiles({ name: "input.srt", mimeType: "text/plain", buffer: Buffer.from("subtitle file") });
+      assert.equal(await rootField.inputValue(), exportRoot);
+      assert.equal(await dialog.getByRole("textbox", { name: "Auto download folder", exact: true }).count(), 0);
+      await dialog.getByRole("textbox", { name: "Run params JSON", exact: true }).fill('{"delay":20}');
+      await page.screenshot({ path: path.join(artifacts, `run-dialog-${type}.png`) });
+      const responsePromise = page.waitForResponse((response) => response.request().method() === "POST" && response.url().endsWith(`/workflows/${flow._id}/runs`));
+      await dialog.getByRole("button", { name: "Run", exact: true }).click();
+      const response = await responsePromise;
+      assert.equal(response.status(), 201);
+      const run = await finished((await response.json()).run._id);
+      assert.equal(run.status, "success");
+      assert.equal(run.items[0].exportDir, path.join(exportRoot, "1"));
+      await fs.access(path.join(exportRoot, "1", path.basename(run.items[0].outputFiles[0].relativePath)));
+    }
+  });
 
   await test("Browser: individual/bulk actions, virtual jobs, lazy graph/files and mobile themes", async () => {
     const run = await start(50, 5000);

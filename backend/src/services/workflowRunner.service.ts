@@ -21,6 +21,7 @@ import { runSupervisedCommand, stopOwnedProcess } from "./processRunner";
 
 interface StartRunInput {
   userId: string; workflowId: string; selectedInputs: Record<string, string | string[]>;
+  exportRoot?: string;
   textInputs: Record<string, string[]>; exportDirs: Record<string, string[]>;
   uploadedFiles: Express.Multer.File[]; params: Record<string, string | number | boolean>;
 }
@@ -402,6 +403,7 @@ export class WorkflowRunnerService {
     selectedInputs: Record<string, string | string[]>;
     textInputs: Record<string, string[]>;
     exportDirs: Record<string, string[]>;
+    exportRoot?: string;
     uploadedFiles: Express.Multer.File[];
     steps: RunStep[];
   }): Promise<PreparedRunItem[]> {
@@ -446,19 +448,22 @@ export class WorkflowRunnerService {
       }
     }
 
-    const configuredTextExportRoots = Array.from(valuesByInput.values())
+    const legacyTextExportRoots = Array.from(valuesByInput.values())
       .flatMap((values) => values)
       .flatMap((value) => (value.kind === "text" && value.exportRoot ? [value.exportRoot] : []));
-    const relativeTextExportRoot = configuredTextExportRoots.find((exportRoot) => !path.isAbsolute(exportRoot));
-    if (relativeTextExportRoot) {
-      throw new HttpError(400, `Auto download root folder must be an absolute path: ${relativeTextExportRoot}`);
+    // The shared root applies to every batch item, regardless of input type.
+    // Preserve exportDirs for clients using the earlier per-file API.
+    const configuredExportRoots = input.exportRoot?.trim() ? [input.exportRoot.trim()] : legacyTextExportRoots;
+    const relativeExportRoot = configuredExportRoots.find((exportRoot) => !path.isAbsolute(exportRoot));
+    if (relativeExportRoot) {
+      throw new HttpError(400, `Auto download root folder must be an absolute path: ${relativeExportRoot}`);
     }
-    const textExportRoots = Array.from(new Set(configuredTextExportRoots.map((exportRoot) => path.resolve(exportRoot))));
-    if (textExportRoots.length > 1) {
-      throw new HttpError(400, "All text inputs must use the same auto download root folder");
+    const exportRoots = Array.from(new Set(configuredExportRoots.map((exportRoot) => path.resolve(exportRoot))));
+    if (exportRoots.length > 1) {
+      throw new HttpError(400, "All inputs must use the same auto download root folder");
     }
-    const allocatedTextExportDirs = textExportRoots[0]
-      ? await this.allocateSequentialExportDirs(textExportRoots[0], batchSize)
+    const allocatedExportDirs = exportRoots[0]
+      ? await this.allocateSequentialExportDirs(exportRoots[0], batchSize)
       : [];
 
     const items: PreparedRunItem[] = [];
@@ -511,7 +516,7 @@ export class WorkflowRunnerService {
         dirs,
         inputFiles,
         inputValues,
-        exportDir: allocatedTextExportDirs[index] || directExportDirs[0]
+        exportDir: allocatedExportDirs[index] || directExportDirs[0]
       });
     }
 

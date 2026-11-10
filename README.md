@@ -158,3 +158,7 @@ npm run test:performance
 `test:e2e` requires MongoDB at `mongodb://127.0.0.1:27017` (override with `QA_MONGODB_URI`) and Chromium at `/usr/bin/chromium` (override with `CHROMIUM_PATH`, or install Playwright's browser). It creates a separate temporary database and DATA_ROOT, tests concurrency/cancellation/reruns/crash recovery and desktop/mobile interactions, then drops only its test database. Screenshots and results are written to `.cache/qa`.
 
 `test:performance` needs Chromium and Git. It compares production builds of the committed frontend (`HEAD`) and the working frontend using 50 synthetic jobs, 20 log chunks per job per second and a status event each second. It records renderer CPU, heap, layout time and traffic in `.cache/qa/performance.json`; its regression target is at least 50% lower renderer CPU and at most approximately four log DOM updates per second. It does not connect to MongoDB or execute workflow commands.
+
+### Auto download root folder
+
+The Run Workflow dialog has one optional **Auto download root folder** for both File and Text inputs. Enter an absolute backend-local path. Every job gets its own numbered subfolder, starting after the largest existing numbered directory (for example, existing `4/` means the next jobs use `5/`, `6/`, etc.). Inputs/outputs marked **Auto download** in the workflow are copied into that job's folder. The create-run API accepts `exportRoot` in JSON or multipart requests; the older `exportDirs` field remains supported for existing clients.

@@ -13,6 +13,7 @@ import { isActiveStatus } from "../services/runState";
 const runBodySchema = z.object({
   inputs: z.record(z.string(), z.union([z.string(), z.array(z.string())])).optional().default({}),
   textInputs: z.record(z.string(), z.array(z.string())).optional().default({}),
+  exportRoot: z.string().trim().optional(),
   exportDirs: z.record(z.string(), z.array(z.string())).optional().default({}),
   params: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional().default({})
 });
@@ -44,6 +45,7 @@ export const createRun = asyncHandler<AuthenticatedRequest>(async (req, res: Res
     inputs: parseJsonField(req.body.inputs),
     textInputs: parseJsonField(req.body.textInputs),
     exportDirs: parseJsonField(req.body.exportDirs),
+    exportRoot: req.body.exportRoot,
     params: parseJsonField(req.body.params)
   });
   const run = await workflowRunnerService.startRun({
@@ -52,6 +54,7 @@ export const createRun = asyncHandler<AuthenticatedRequest>(async (req, res: Res
     selectedInputs: body.inputs,
     textInputs: body.textInputs,
     exportDirs: body.exportDirs,
+    exportRoot: body.exportRoot,
     uploadedFiles: Array.isArray(req.files) ? req.files : [],
     params: body.params
   });

@@ -25,8 +25,7 @@ export function RunDialog({ workflow, open, onClose }: Props) {
   const navigate = useNavigate();
   const [files, setFiles] = useState<Record<string, File[]>>({});
   const [textInputs, setTextInputs] = useState<Record<string, string>>({});
-  const [exportDirs, setExportDirs] = useState<Record<string, string[]>>({});
-  const [textExportDirs, setTextExportDirs] = useState<Record<string, string>>({});
+  const [exportRoot, setExportRoot] = useState("");
   const [paramsJson, setParamsJson] = useState("{}");
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
@@ -34,7 +33,6 @@ export function RunDialog({ workflow, open, onClose }: Props) {
   const addFile = (inputName: string, file?: File) => {
     if (!file) return;
     setFiles((current) => ({ ...current, [inputName]: [...(current[inputName] || []), file] }));
-    setExportDirs((current) => ({ ...current, [inputName]: [...(current[inputName] || []), ""] }));
   };
 
   const removeFile = (inputName: string, index: number) => {
@@ -42,18 +40,6 @@ export function RunDialog({ workflow, open, onClose }: Props) {
       ...current,
       [inputName]: (current[inputName] || []).filter((_file, fileIndex) => fileIndex !== index)
     }));
-    setExportDirs((current) => ({
-      ...current,
-      [inputName]: (current[inputName] || []).filter((_dir, dirIndex) => dirIndex !== index)
-    }));
-  };
-
-  const setExportDir = (inputName: string, index: number, value: string) => {
-    setExportDirs((current) => {
-      const items = current[inputName]?.length ? [...current[inputName]] : [""];
-      items[index] = value;
-      return { ...current, [inputName]: items };
-    });
   };
 
   const requiredInputs = useMemo(() => {
@@ -100,19 +86,7 @@ export function RunDialog({ workflow, open, onClose }: Props) {
         }
       }
       formData.append("textInputs", JSON.stringify(parsedTextInputs));
-      const exportDirPayload: Record<string, string[]> = {};
-      for (const [inputName, inputFiles] of Object.entries(files)) {
-        if (inputFiles.length) {
-          exportDirPayload[inputName] = inputFiles.map((_file, index) => (exportDirs[inputName]?.[index] || "").trim());
-        }
-      }
-      for (const [inputName, values] of Object.entries(parsedTextInputs)) {
-        const exportRoot = (textExportDirs[inputName] || "").trim();
-        if (values.length > 0 && exportRoot) {
-          exportDirPayload[inputName] = [exportRoot];
-        }
-      }
-      formData.append("exportDirs", JSON.stringify(exportDirPayload));
+      formData.append("exportRoot", exportRoot.trim());
       formData.append("params", JSON.stringify(JSON.parse(paramsJson || "{}")));
       formData.append("inputs", JSON.stringify({}));
       const response = await api.post(`/workflows/${workflow._id}/runs`, formData);
@@ -136,7 +110,6 @@ export function RunDialog({ workflow, open, onClose }: Props) {
           ) : (
             requiredInputs.map((input) => {
               const selectedFiles = files[input.name] || [];
-              const itemExportDirs = exportDirs[input.name] || [];
               if (input.type === "text") {
                 const textValue = textInputs[input.name] || "";
                 const itemCount = textValue
@@ -157,17 +130,6 @@ export function RunDialog({ workflow, open, onClose }: Props) {
                         multiline
                         fullWidth
                         helperText={`${itemCount} item${itemCount === 1 ? "" : "s"}. Each non-empty line becomes one batch item.`}
-                      />
-                      <TextField
-                        label="Auto download root folder"
-                        placeholder="/home/tungflam/Downloads/workflow-output"
-                        value={textExportDirs[input.name] || ""}
-                        onChange={(event) =>
-                          setTextExportDirs((current) => ({ ...current, [input.name]: event.target.value }))
-                        }
-                        size="small"
-                        fullWidth
-                        helperText="Optional absolute path. Numbered folders are created from the next available number, one per item."
                       />
                     </Stack>
                   </Box>
@@ -209,15 +171,6 @@ export function RunDialog({ workflow, open, onClose }: Props) {
                                 <DeleteIcon fontSize="small" />
                               </IconButton>
                             </Stack>
-                            <TextField
-                              label="Auto download folder"
-                              placeholder="/home/tungflam/Downloads/workflow-output"
-                              value={itemExportDirs[index] || ""}
-                              onChange={(event) => setExportDir(input.name, index, event.target.value)}
-                              size="small"
-                              fullWidth
-                              helperText="Optional absolute folder path."
-                            />
                           </Stack>
                         ))}
                       </Stack>
@@ -227,6 +180,15 @@ export function RunDialog({ workflow, open, onClose }: Props) {
               );
             })
           )}
+          <TextField
+            label="Auto download root folder"
+            placeholder="/home/user/Downloads/workflow-output"
+            value={exportRoot}
+            onChange={(event) => setExportRoot(event.target.value)}
+            size="small"
+            fullWidth
+            helperText="Optional absolute path for file and text inputs. Numbered folders are created from the next available number, one per job. Files marked Auto download are copied there."
+          />
           <TextField
             label="Run params JSON"
             value={paramsJson}
